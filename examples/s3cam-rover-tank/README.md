@@ -71,8 +71,20 @@ The camera settings are sent to the tank on every change and once per second, so
 - ESPNowCam callbacks run in the WiFi task: the CYD only copies the frame there, the tank only sets flags (pong reply and sensor changes happen in `loop()`). `sendData()` uses global state, so the CYD guards it with a mutex.
 - Both sides broadcast, no MAC addresses to configure. Two CYDs on the same tank id would both control it.
 
+## Combat plan (not implemented yet, only `FIRE_PIN` / `fire` flag are prepared)
+
+Decision: modulated IR (38 kHz) with a small code containing the shooter id, instead of laser pointer + photodiode.
+
+- Why IR: IR receiver modules (TSOP38238 / VS1838B) reject ambient light and sunlight, the code can carry the tank id, and it is eye-safe. Laser + raw photodiode is sensitive to light, needs modulation anyway, carries no id and is a laser class 2 eye risk.
+- Transmitter: 940 nm LED with a narrow angle (e.g. TSAL6200, about +-5 degrees) switched by a transistor/MOSFET (a GPIO is too weak), 38 kHz carrier via LEDC or IRremote (ESP32-S3 compatibility still to be checked). A black tube / heat shrink (5-10 cm) in front narrows the beam. Mount it next to the camera, parallel to the view axis, so the crosshair matches.
+- Receivers: one module each at front, left, right and back, each with a small shroud. Hit zones allow different damage (e.g. more from behind).
+- Game logic: tank detects a hit and reports it via ESP-NOW (new `RvType`, e.g. `RV_HIT`) to its own CYD, which shows lives/HUD/hit effect. Hit = tank disabled for about 2 s. Fire rate limit (about 1 shot per 0.5-1 s) on the tank.
+- Limitation: every tank/CYD pair has its own channel, so hits and lives are local per tank. A shared scoreboard would need a channel bridge or a referee, later.
+- Order: 1 tank with emitter + receiver and hit display on the CYD, then a second tank, then hit zones and rules.
+
 ## Notes / open points
 
+- Menu: START + SELECT opens/closes it (B or A on "Close" also close it).
 - Not tested on hardware yet, only compiled.
 - Start/fire: pressing START slightly before SELECT sends one fire packet before the menu opens.
 - Battle mode later: IR emitter on `FIRE_PIN` with a receiver/hit detection on the other tanks, hit reports could use a new `RvType`.
