@@ -67,7 +67,6 @@ static volatile bool camPending = false;
 static RvCam camNew;
 static RvCam camApplied;
 static bool camAppliedValid = false;
-static volatile uint8_t jpgQuality = 15;
 
 static const framesize_t frameSizes[] = {FRAMESIZE_QQVGA, FRAMESIZE_HQVGA, FRAMESIZE_QVGA};
 
@@ -135,9 +134,9 @@ void applyCam() {
   if (first || c.brightness != camApplied.brightness) s->set_brightness(s, constrain(c.brightness, -2, 2));
   if (first || c.contrast != camApplied.contrast) s->set_contrast(s, constrain(c.contrast, -2, 2));
   if (first || c.saturation != camApplied.saturation) s->set_saturation(s, constrain(c.saturation, -2, 2));
+  if (first || c.quality != camApplied.quality) s->set_quality(s, 63 - constrain(c.quality, 5, 50));
   if (first || c.hmirror != camApplied.hmirror) s->set_hmirror(s, c.hmirror);
   if (first || c.vflip != camApplied.vflip) s->set_vflip(s, c.vflip);
-  jpgQuality = constrain(c.quality, 5, 50);
   camApplied = c;
   camAppliedValid = true;
 }
@@ -149,12 +148,27 @@ void sendPong() {
 }
 
 void processFrame() {
-  if (Camera.get()) {
-    uint8_t *out_jpg = NULL;
-    size_t out_jpg_len = 0;
-    frame2jpg(Camera.fb, jpgQuality, &out_jpg, &out_jpg_len);
-    radio.sendData(out_jpg, out_jpg_len);
-    free(out_jpg);
+  if (Camera.get() && Camera.fb->format == PIXFORMAT_JPEG) {
+    static uint32_t windowStart = millis();
+    static uint32_t frames = 0;
+    static uint32_t totalSendUs = 0;
+    static uint32_t totalBytes = 0;
+    uint32_t sendStart = micros();
+    radio.sendData(Camera.fb->buf, Camera.fb->len);
+    totalSendUs += micros() - sendStart;
+    totalBytes += Camera.fb->len;
+    frames++;
+    Camera.free();
+    uint32_t elapsed = millis() - windowStart;
+    if (elapsed >= 2000) {
+      Serial.printf("TX %.1f fps, %.1f ms/frame, %.1f KB/frame\r\n",
+                    frames * 1000.0f / elapsed,
+                    totalSendUs / 1000.0f / frames,
+                    totalBytes / 1024.0f / frames);
+      windowStart = millis();
+      frames = totalSendUs = totalBytes = 0;
+    }
+  } else if (Camera.fb) {
     Camera.free();
   }
 }
@@ -178,7 +192,9 @@ void setup() {
   servoLeft.setPeriodHertz(50);
   servoRight.setPeriodHertz(50);
 
-  if (Camera.begin()) Serial.println("Camera Init Success");
+  Camera.config.pixel_format = PIXFORMAT_JPEG;
+  Camera.config.jpeg_quality = 15;
+  if (Camera.begin()) Serial.println("Camera Init Success (native JPEG)");
   else Serial.println("Camera Init Failed");
 
   recv_buff = static_cast<uint8_t *>(ps_malloc(100));

@@ -70,7 +70,7 @@ UP/DOWN select, LEFT/RIGHT change (hold = repeat), A runs "Scan"/"Close", B clos
 
 - Tank: 1..7, switches the CYD to that channel and addresses only that tank.
 - Scan tanks: pings channels 1..7 and jumps to the first tank found.
-- Resolution 160x120 / 240x176 / 320x240, JPEG quality 5..50 (higher = bigger frames), brightness / contrast / saturation -2..2, mirror, flip.
+- Resolution 160x120 / 240x176 / 320x240, JPEG quality 5..50 (higher = better quality and larger frames), brightness / contrast / saturation -2..2, mirror, flip.
 - Crosshair on/off (center of the screen, for the later shooting version).
 
 The camera settings are sent to the tank on every change and once per second, so a rebooted tank gets them again.
@@ -78,7 +78,7 @@ The camera settings are sent to the tank on every change and once per second, so
 ## Protocol
 
 - Every tank has its own ESP-NOW channel (= DIP value), so several tank/CYD pairs do not share airtime. Packets also carry the tank id.
-- Video: JPEG chunks via ESPNowCam (data starts with 0xFF). Control packets start with `RV_MAGIC` 0xA5: `RV_DRIVE`, `RV_CAM`, `RV_PING`, `RV_PONG`.
+- Video: the camera sensor produces JPEG directly; JPEG chunks go via ESPNowCam (data starts with 0xFF). This avoids the former CPU-side RGB565-to-JPEG conversion. The serial monitor reports `TX fps`, average send time and average frame size every two seconds. Control packets start with `RV_MAGIC` 0xA5: `RV_DRIVE`, `RV_CAM`, `RV_PING`, `RV_PONG`.
 - ESPNowCam callbacks run in the WiFi task: the CYD only copies the frame there, the tank only sets flags (pong reply and sensor changes happen in `loop()`). `sendData()` uses global state, so the CYD guards it with a mutex.
 - Both sides broadcast, no MAC addresses to configure. Two CYDs on the same tank id would both control it.
 
