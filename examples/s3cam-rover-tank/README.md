@@ -22,6 +22,17 @@ pio run -e cyd-rover-controller
 esptool.py write_flash 0x0 <env>_<timestamp>.bin
 ```
 
+For a webflasher that accepts separate files and offsets, a S3 build also writes four timestamp-matched files to the repo root:
+
+| File suffix | Flash offset |
+|---|---:|
+| `_bootloader.bin` | `0x0` |
+| `_partitions.bin` | `0x8000` |
+| `_boot_app0.bin` | `0xE000` |
+| `_firmware.bin` | `0x10000` |
+
+Select all four files from the same timestamp in the webflasher and enter the offsets above. If the webflasher accepts one merged image instead, select `<env>_<timestamp>.bin` at offset `0x0`. The CYD build continues to produce its single merged image.
+
 Project rule: the newest binary of both envs is always committed and pushed to GitHub (`origin` = flow1986/ESPNowCam).
 
 ## Hardware
