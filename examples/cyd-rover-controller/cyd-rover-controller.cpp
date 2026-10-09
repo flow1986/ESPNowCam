@@ -5,9 +5,9 @@
  * This file is part ESPNowCam project:
  * https://github.com/hpsaturn/ESPNowCam
  *
- * Drive mode:   A forward, B backward, LEFT/RIGHT turn
- * Gripper mode: A lift up, B lift down, LEFT gripper open, RIGHT gripper close
- * Both modes:   UP/DOWN speed +10% / -10%, START fire (held)
+ * Drive mode:   A forward, B backward, LEFT/RIGHT turn, UP/DOWN speed +10% / -10%
+ * Gripper mode: A forward, B backward, UP/DOWN lift up/down, LEFT/RIGHT gripper open/close
+ * Both modes:   START fire (held)
  * SELECT short: switch drive / gripper mode, SELECT long: speed back to 50%
  * START+SELECT: config menu (UP/DOWN select, LEFT/RIGHT change, A scan/close, B close)
 **************************************************/
@@ -258,13 +258,13 @@ void controlTask(void *arg) {
     int8_t fwd = 0, turn = 0;
     uint8_t fire = 0;
     if (!menuOpen && !suppress) {
-      if ((pressed & BTN_UP) && speedPct < 100) speedPct = speedPct + 10;
-      if ((pressed & BTN_DOWN) && speedPct > 0) speedPct = speedPct - 10;
       fire = (b & BTN_START) && !(b & BTN_SELECT);
+      int s = speedPct;
+      fwd = ((b & BTN_A) ? s : 0) - ((b & BTN_B) ? s : 0);
       if (gripperMode) {
         float step = GRIP_RATE_PCT_S * dt;
-        if (b & BTN_A) lp += step;
-        if (b & BTN_B) lp -= step;
+        if (b & BTN_UP) lp += step;
+        if (b & BTN_DOWN) lp -= step;
         if (b & BTN_RIGHT) gp += step;
         if (b & BTN_LEFT) gp -= step;
         gp = constrain(gp, 0.0f, 100.0f);
@@ -272,8 +272,8 @@ void controlTask(void *arg) {
         gripPct = (int)(gp + 0.5f);
         liftPct = (int)(lp + 0.5f);
       } else {
-        int s = speedPct;
-        fwd = ((b & BTN_A) ? s : 0) - ((b & BTN_B) ? s : 0);
+        if ((pressed & BTN_UP) && speedPct < 100) speedPct = speedPct + 10;
+        if ((pressed & BTN_DOWN) && speedPct > 0) speedPct = speedPct - 10;
         turn = ((b & BTN_RIGHT) ? s : 0) - ((b & BTN_LEFT) ? s : 0);
       }
     }

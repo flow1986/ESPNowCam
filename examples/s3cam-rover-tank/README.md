@@ -59,15 +59,15 @@ Project rule: the newest binary of both envs is always committed and pushed to G
 |---|---|
 | SELECT (short) | switch between drive mode and gripper mode (shown in the HUD) |
 | SELECT (long, 0.6 s) | speed back to 50% |
-| UP / DOWN | speed +10% / -10% (default 50%), both modes |
-| A / B | drive mode: forward / backward. Gripper mode: lift up / down |
+| UP / DOWN | drive mode: speed +10% / -10% (default 50%). Gripper mode: lift up / down |
+| A / B | forward / backward, both modes |
 | LEFT / RIGHT | drive mode: turn. Gripper mode: gripper open / close |
 | START (held) | fire (prepared: `fire` flag in `RvDrive`, tank `setFire()` / `FIRE_PIN`) |
 | START + SELECT | open / close the config menu |
 
 The HUD (top left) shows tank id and mode: `T1 DRIVE SPD 50%` or `T1 GRIP G50 L50` (gripper and lift position in percent). Green/yellow = tank online, red = offline.
 
-In gripper mode the tank does not drive. The gripper moves with 60%/s while a key is held (`GRIP_RATE_PCT_S`), the CYD sends the absolute positions, the tank holds the last position if the link is lost. 0% = min pulse, 100% = max pulse; if a direction is wrong, switch "Grip reverse" / "Lift reverse".
+In gripper mode the tank drives forward/backward with A/B at the current speed, but cannot turn and the speed cannot be changed (switch back to drive mode for that). The gripper moves with 60%/s while a key is held (`GRIP_RATE_PCT_S`), the CYD sends the absolute positions, the tank holds the last position if the link is lost. 0% = min pulse, 100% = max pulse; if a direction is wrong, switch "Grip reverse" / "Lift reverse".
 
 ## Config menu
 
