@@ -45,9 +45,11 @@ Project rule: the newest binary of both envs is always committed and pushed to G
 ### Tank (Freenove ESP32-S3 WROOM CAM pinout, `CamFreenove` driver, `dio_opi`)
 - Servos: left GPIO47, right GPIO21 (build flags `SERVO_L_PIN`, `SERVO_R_PIN`).
 - Right servo is inverted (mirrored mounting): `SERVO_L_INVERT`, `SERVO_R_INVERT`.
-- Trim: `SERVO_L_CENTER_US`, `SERVO_R_CENTER_US` (neutral pulse, default 1500), `SERVO_RANGE_US` (default 400).
+- Neutral pulse (center) of the drive servos is calibrated in the CYD menu (see below), `SERVO_RANGE_US` (default 400) is the pulse offset at 100% speed.
+- Gripper (normal positional servos): grip servo GPIO41, lift servo GPIO42 (`GRIP_PIN`, `LIFT_PIN`). Verify these pins against your board pinout. Min/max pulse and reverse are set in the CYD menu.
+- The camera clock uses LEDC timer 3 / channel 7, the servos only get timers 0..2, so the PWM of the servos cannot disturb the camera.
 - Channel DIP switch (3 switches, each between GPIO and GND, internal pull-ups): bit0 GPIO1, bit1 GPIO2, bit2 GPIO14 (`CH_PIN0..2`). ON = 1. Value 1..7 = tank id = ESP-NOW channel; 000 falls back to 1. GPIO1/2/14 are not strapping pins.
-- Weapon output: `FIRE_PIN` (default -1 = none). Set e.g. `-D FIRE_PIN=41` for a laser/IR emitter; it is high while START is held on the CYD and off on failsafe.
+- Weapon output: `FIRE_PIN` (default -1 = none). Set e.g. `-D FIRE_PIN=40` for a laser/IR emitter (41/42 are used by the gripper); it is high while START is held on the CYD and off on failsafe.
 - Failsafe: no command for 500 ms stops the servos and the fire output.
 - Other S3 boards: change the camera driver and the memory type in `platformio.ini`.
 
@@ -55,14 +57,17 @@ Project rule: the newest binary of both envs is always committed and pushed to G
 
 | Button | Function |
 |---|---|
-| A / B | forward / backward |
-| LEFT / RIGHT | turn |
-| UP / DOWN | speed +10% / -10% (default 50%) |
-| SELECT | speed back to 50% |
+| SELECT (short) | switch between drive mode and gripper mode (shown in the HUD) |
+| SELECT (long, 0.6 s) | speed back to 50% |
+| UP / DOWN | speed +10% / -10% (default 50%), both modes |
+| A / B | drive mode: forward / backward. Gripper mode: lift up / down |
+| LEFT / RIGHT | drive mode: turn. Gripper mode: gripper open / close |
 | START (held) | fire (prepared: `fire` flag in `RvDrive`, tank `setFire()` / `FIRE_PIN`) |
 | START + SELECT | open / close the config menu |
 
-The HUD (top left) shows tank id and speed, green = tank online, red = offline.
+The HUD (top left) shows tank id and mode: `T1 DRIVE SPD 50%` or `T1 GRIP G50 L50` (gripper and lift position in percent). Green/yellow = tank online, red = offline.
+
+In gripper mode the tank does not drive. The gripper moves with 60%/s while a key is held (`GRIP_RATE_PCT_S`), the CYD sends the absolute positions, the tank holds the last position if the link is lost. 0% = min pulse, 100% = max pulse; if a direction is wrong, switch "Grip reverse" / "Lift reverse".
 
 ## Config menu
 
@@ -72,13 +77,18 @@ UP/DOWN select, LEFT/RIGHT change (hold = repeat), A runs "Scan"/"Close", B clos
 - Scan tanks: pings channels 1..7 and jumps to the first tank found.
 - Resolution 160x120 / 240x176 / 320x240, JPEG quality 5..50 (higher = better quality and larger frames), brightness / contrast / saturation -2..2, mirror, flip.
 - Crosshair on/off (center of the screen, for the later shooting version).
+- Servo calibration (stored per tank id on the CYD, sent to the tank every second):
+  - Servo L / R center (1000..2000 us, 5 us steps, 20 us while held): while one of these items is selected the tank holds both drive servos at their neutral pulse, adjust until they stand still. For continuous rotation servos the center is the important value.
+  - Grip min / max and Lift min / max (500..2500 us, 10 us steps, 40 us while held): while an item is selected the tank moves that servo to this pulse, so the end positions can be set by eye. Grip reverse / Lift reverse invert the direction.
+- The menu scrolls (19 items).
+- The settings layout changed with the calibration: a config saved by an older firmware is ignored once and the defaults are used.
 
 The camera settings are sent to the tank on every change and once per second, so a rebooted tank gets them again.
 
 ## Protocol
 
 - Every tank has its own ESP-NOW channel (= DIP value), so several tank/CYD pairs do not share airtime. Packets also carry the tank id.
-- Video: the camera sensor produces JPEG directly; JPEG chunks go via ESPNowCam (data starts with 0xFF). This avoids the former CPU-side RGB565-to-JPEG conversion. The serial monitor reports `TX fps`, average send time and average frame size every two seconds. Control packets start with `RV_MAGIC` 0xA5: `RV_DRIVE`, `RV_CAM`, `RV_PING`, `RV_PONG`.
+- Video: the camera sensor produces JPEG directly; JPEG chunks go via ESPNowCam (data starts with 0xFF). This avoids the former CPU-side RGB565-to-JPEG conversion. The serial monitor reports `TX fps`, average send time and average frame size every two seconds. Control packets start with `RV_MAGIC` 0xA5: `RV_DRIVE` (drive, fire, gripper and lift positions), `RV_CAM`, `RV_SERVO` (calibration and preview), `RV_PING`, `RV_PONG`.
 - ESPNowCam callbacks run in the WiFi task: the CYD only copies the frame there, the tank only sets flags (pong reply and sensor changes happen in `loop()`). `sendData()` uses global state, so the CYD guards it with a mutex.
 - Both sides broadcast, no MAC addresses to configure. Two CYDs on the same tank id would both control it.
 
