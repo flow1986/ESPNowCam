@@ -21,13 +21,6 @@
 #ifndef SERVO_R_PIN
 #define SERVO_R_PIN 21
 #endif
-// the servos are mirrored on a tank, so one of them must be inverted
-#ifndef SERVO_L_INVERT
-#define SERVO_L_INVERT 0
-#endif
-#ifndef SERVO_R_INVERT
-#define SERVO_R_INVERT 1
-#endif
 // pulse width offset at 100% speed (the neutral pulse is calibrated on the CYD)
 #ifndef SERVO_RANGE_US
 #define SERVO_RANGE_US 400
@@ -72,7 +65,7 @@ static RvCam camApplied;
 static bool camAppliedValid = false;
 
 // calibration, replaced by the values of the CYD
-static RvServo sv = {{RV_MAGIC, RV_SERVO, 0}, 1500, 1500, 1000, 2000, 1000, 2000, 0, 0, 0};
+static RvServo sv = {{RV_MAGIC, RV_SERVO, 0}, 1500, 1500, 1000, 2000, 1000, 2000, 0, 0, 0, 1, 0};
 static int gripPct = 50, liftPct = 50;
 static bool gripperActive = false;  // after the first drive packet
 static int lastGripUs = 0, lastLiftUs = 0;
@@ -108,8 +101,8 @@ void driveServo(Servo &servo, int pin, int pct, bool invert, int centerUs) {
 void drive(int fwd, int turn) {
   int l = constrain(fwd + turn, -100, 100);
   int r = constrain(fwd - turn, -100, 100);
-  driveServo(servoLeft, SERVO_L_PIN, l, SERVO_L_INVERT, sv.centerL);
-  driveServo(servoRight, SERVO_R_PIN, r, SERVO_R_INVERT, sv.centerR);
+  driveServo(servoLeft, SERVO_L_PIN, l, sv.revL, sv.centerL);
+  driveServo(servoRight, SERVO_R_PIN, r, sv.revR, sv.centerR);
 }
 
 int posToUs(int pct, int minUs, int maxUs, bool rev) {

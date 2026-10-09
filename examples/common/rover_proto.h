@@ -48,5 +48,6 @@ struct __attribute__((packed)) RvServo {
   uint16_t gripMin, gripMax;  // us
   uint16_t liftMin, liftMax;  // us
   uint8_t gripRev, liftRev;
+  uint8_t revL, revR;  // reverse the left / right drive servo
   uint8_t preview;
 };

@@ -61,6 +61,8 @@ struct ServoCfg {
   uint16_t liftMax = 2000;
   uint8_t gripRev = 0;
   uint8_t liftRev = 0;
+  uint8_t revL = 0;
+  uint8_t revR = 1;  // the servos are mirrored on a tank
 };
 
 struct Cfg {
@@ -104,17 +106,18 @@ static char scanMsg[32] = "";
 static int menuSel = 0;
 static int menuScroll = 0;
 
-#define MENU_ITEMS 19
+#define MENU_ITEMS 21
 enum MenuItem {
   M_TANK, M_SCAN, M_RES, M_QUALITY, M_BRIGHT, M_CONTRAST, M_SAT, M_MIRROR, M_FLIP, M_CROSS,
-  M_CENTER_L, M_CENTER_R, M_GRIP_MIN, M_GRIP_MAX, M_GRIP_REV, M_LIFT_MIN, M_LIFT_MAX, M_LIFT_REV,
-  M_CLOSE
+  M_CENTER_L, M_CENTER_R, M_REV_L, M_REV_R, M_GRIP_MIN, M_GRIP_MAX, M_GRIP_REV, M_LIFT_MIN, M_LIFT_MAX,
+  M_LIFT_REV, M_CLOSE
 };
 static const char *labels[MENU_ITEMS] = {"Tank",        "Scan tanks",   "Resolution", "JPEG quality",
                                          "Brightness",  "Contrast",     "Saturation", "Mirror",
                                          "Flip",        "Crosshair",    "Servo L center", "Servo R center",
-                                         "Grip min",    "Grip max",     "Grip reverse",   "Lift min",
-                                         "Lift max",    "Lift reverse", "Close"};
+                                         "Servo L reverse", "Servo R reverse", "Grip min", "Grip max",
+                                         "Grip reverse", "Lift min",    "Lift max",      "Lift reverse",
+                                         "Close"};
 static const char *sizeNames[3] = {"160x120", "240x176", "320x240"};
 
 bool tankOnline() { return millis() - lastPong < 2000 || millis() - lastFrameStamp < 2000; }
@@ -287,8 +290,8 @@ void controlTask(void *arg) {
       }
       // calibration: sent at once on every change, otherwise once per second
       ServoCfg &sc = curServo();
-      RvServo s = {{RV_MAGIC, RV_SERVO, cfg.tank}, sc.centerL, sc.centerR, sc.gripMin, sc.gripMax,
-                   sc.liftMin,                     sc.liftMax, sc.gripRev, sc.liftRev,  servoPreview()};
+      RvServo s = {{RV_MAGIC, RV_SERVO, cfg.tank}, sc.centerL, sc.centerR, sc.gripMin, sc.gripMax, sc.liftMin,
+                   sc.liftMax, sc.gripRev, sc.liftRev, sc.revL, sc.revR, servoPreview()};
       if (memcmp(&s, &lastServo, sizeof(s)) != 0 || now - lastServoSend > 1000) {
         sendPacket(&s, sizeof(s));
         lastServo = s;
@@ -319,6 +322,8 @@ void menuValue(int i, char *out, size_t n) {
     case M_CROSS: snprintf(out, n, "%s", cfg.crosshair ? "on" : "off"); break;
     case M_CENTER_L: snprintf(out, n, "< %u us >", sc.centerL); break;
     case M_CENTER_R: snprintf(out, n, "< %u us >", sc.centerR); break;
+    case M_REV_L: snprintf(out, n, "%s", sc.revL ? "on" : "off"); break;
+    case M_REV_R: snprintf(out, n, "%s", sc.revR ? "on" : "off"); break;
     case M_GRIP_MIN: snprintf(out, n, "< %u us >", sc.gripMin); break;
     case M_GRIP_MAX: snprintf(out, n, "< %u us >", sc.gripMax); break;
     case M_GRIP_REV: snprintf(out, n, "%s", sc.gripRev ? "on" : "off"); break;
@@ -407,6 +412,8 @@ void changeValue(int item, int d, int mult) {
     case M_CROSS: cfg.crosshair ^= 1; break;
     case M_CENTER_L: sc.centerL = constrain((int)sc.centerL + d * 5 * mult, 1000, 2000); break;
     case M_CENTER_R: sc.centerR = constrain((int)sc.centerR + d * 5 * mult, 1000, 2000); break;
+    case M_REV_L: sc.revL ^= 1; break;
+    case M_REV_R: sc.revR ^= 1; break;
     case M_GRIP_MIN: sc.gripMin = constrain((int)sc.gripMin + d * 10 * mult, 500, 2500); break;
     case M_GRIP_MAX: sc.gripMax = constrain((int)sc.gripMax + d * 10 * mult, 500, 2500); break;
     case M_GRIP_REV: sc.gripRev ^= 1; break;
