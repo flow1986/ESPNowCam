@@ -40,7 +40,7 @@ Project rule: the newest binary of both envs is always committed and pushed to G
 ### CYD (ESP32-2432S028R, hardware of https://github.com/flow1986/cyd-gb)
 - PCF8574 at I2C 0x20, SDA = GPIO16, SCL = GPIO17.
 - PCF bits: 0 UP, 1 DOWN, 2 LEFT, 3 RIGHT, 4 A, 5 B, 6 START, 7 SELECT (pressed = low).
-- Display ILI9341 (TFT_eSPI flags in `platformio.ini`), inverted, rotation 2 (portrait). The camera image is rotated 90 degrees to fill the screen (`-D VIEW_ROTATE=0` for landscape).
+- Display ILI9341 (TFT_eSPI flags in `platformio.ini`), inverted. The camera view rotation (0/90/180/270 degrees) is a menu setting, default 90 (image rotated to fill the portrait screen).
 
 ### Tank (Freenove ESP32-S3 WROOM CAM pinout, `CamFreenove` driver, `dio_opi`)
 - Servos: left GPIO47, right GPIO21 (build flags `SERVO_L_PIN`, `SERVO_R_PIN`).
@@ -81,7 +81,8 @@ UP/DOWN select, LEFT/RIGHT change (hold = repeat), A runs "Scan"/"Close", B clos
   - Servo L / R center (1000..2000 us, 5 us steps, 20 us while held): while one of these items is selected the tank holds both drive servos at their neutral pulse, adjust until they stand still. For continuous rotation servos the center is the important value.
   - Servo L reverse / Servo R reverse: invert the direction of each drive servo separately (default: left off, right on). If the tank turns on the spot when you drive forward, one of them is wrong; if it drives backward, switch both.
   - Grip min / max and Lift min / max (500..2500 us, 10 us steps, 40 us while held): while an item is selected the tank moves that servo to this pulse, so the end positions can be set by eye. Grip reverse / Lift reverse invert the direction.
-- The menu scrolls (21 items).
+- The menu scrolls (22 items).
+- Rotation: 0 / 180 = landscape view, 90 / 270 = portrait view filling the screen. Stored on the CYD (own NVS key, independent of the config layout), not per tank.
 - The settings layout changed with the calibration: a config saved by an older firmware is ignored once and the defaults are used.
 
 The camera settings are sent to the tank on every change and once per second, so a rebooted tank gets them again.

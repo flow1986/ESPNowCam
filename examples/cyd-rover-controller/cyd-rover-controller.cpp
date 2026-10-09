@@ -42,13 +42,7 @@
 #define GRIP_RATE_PCT_S 60
 #endif
 
-// 1: camera image rotated 90 degrees to fill the portrait screen, 0: landscape
-#ifndef VIEW_ROTATE
-#define VIEW_ROTATE 1
-#endif
-
-// the menu is drawn below this line, above it the live image stays visible (portrait only)
-#define MENU_TOP (VIEW_ROTATE ? 96 : 0)
+// the menu is drawn below menuTop(), above it the live image stays visible (portrait only)
 #define ROW_H 18
 
 // calibration is stored per tank id
@@ -106,18 +100,28 @@ static char scanMsg[32] = "";
 static int menuSel = 0;
 static int menuScroll = 0;
 
-#define MENU_ITEMS 21
+// camera view rotation 0..3 = 0/90/180/270 degrees, 90 and 270 fill the portrait screen
+static uint8_t viewRot = 1;
+bool portrait() { return viewRot & 1; }
+int menuTop() { return portrait() ? 96 : 0; }
+
+void applyRotation() {
+  static const uint8_t tftRot[4] = {1, 2, 3, 0};
+  tft.setRotation(tftRot[viewRot & 3]);
+  tft.fillScreen(TFT_BLACK);
+}
+#define MENU_ITEMS 22
 enum MenuItem {
-  M_TANK, M_SCAN, M_RES, M_QUALITY, M_BRIGHT, M_CONTRAST, M_SAT, M_MIRROR, M_FLIP, M_CROSS,
+  M_TANK, M_SCAN, M_RES, M_QUALITY, M_BRIGHT, M_CONTRAST, M_SAT, M_MIRROR, M_FLIP, M_ROT, M_CROSS,
   M_CENTER_L, M_CENTER_R, M_REV_L, M_REV_R, M_GRIP_MIN, M_GRIP_MAX, M_GRIP_REV, M_LIFT_MIN, M_LIFT_MAX,
   M_LIFT_REV, M_CLOSE
 };
 static const char *labels[MENU_ITEMS] = {"Tank",        "Scan tanks",   "Resolution", "JPEG quality",
                                          "Brightness",  "Contrast",     "Saturation", "Mirror",
-                                         "Flip",        "Crosshair",    "Servo L center", "Servo R center",
-                                         "Servo L reverse", "Servo R reverse", "Grip min", "Grip max",
-                                         "Grip reverse", "Lift min",    "Lift max",      "Lift reverse",
-                                         "Close"};
+                                         "Flip",        "Rotation",     "Crosshair",  "Servo L center",
+                                         "Servo R center", "Servo L reverse", "Servo R reverse", "Grip min",
+                                         "Grip max",    "Grip reverse", "Lift min",   "Lift max",
+                                         "Lift reverse", "Close"};
 static const char *sizeNames[3] = {"160x120", "240x176", "320x240"};
 
 bool tankOnline() { return millis() - lastPong < 2000 || millis() - lastFrameStamp < 2000; }
@@ -130,9 +134,14 @@ void loadCfg() {
   // a stored config of an older layout has another size and is ignored
   if (prefs.getBytes("cfg", &tmp, sizeof(tmp)) == sizeof(tmp)) cfg = tmp;
   cfg.tank = constrain(cfg.tank, 1, RV_MAX_TANKS);
+  // own key, so adding it did not invalidate the stored config
+  viewRot = prefs.getUChar("rot", 1) & 3;
 }
 
-void saveCfg() { prefs.putBytes("cfg", &cfg, sizeof(cfg)); }
+void saveCfg() {
+  prefs.putBytes("cfg", &cfg, sizeof(cfg));
+  prefs.putUChar("rot", viewRot);
+}
 
 void sendPacket(const void *p, size_t n) {
   xSemaphoreTake(radioMutex, portMAX_DELAY);
@@ -163,18 +172,19 @@ void onRecv(uint32_t length) {
 }
 
 bool tftOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
-#if VIEW_ROTATE
-  static uint16_t blk[16 * 16];
-  if (w > 16 || h > 16) return true;
-  int dx = offX + imgH - y - h, dy = offY + x;
-  if (menuOpen && dy + w > MENU_TOP) return true;
-  for (int j = 0; j < h; j++)
-    for (int i = 0; i < w; i++) blk[i * h + (h - 1 - j)] = bitmap[j * w + i];
-  tft.pushImage(dx, dy, h, w, blk);
-#else
-  if (menuOpen) return true;
-  tft.pushImage(offX + x, offY + y, w, h, bitmap);
-#endif
+  if (portrait()) {
+    // transpose the block: 90 / 270 degrees (the tft rotation does the rest)
+    static uint16_t blk[16 * 16];
+    if (w > 16 || h > 16) return true;
+    int dx = offX + imgH - y - h, dy = offY + x;
+    if (menuOpen && dy + w > menuTop()) return true;
+    for (int j = 0; j < h; j++)
+      for (int i = 0; i < w; i++) blk[i * h + (h - 1 - j)] = bitmap[j * w + i];
+    tft.pushImage(dx, dy, h, w, blk);
+  } else {
+    if (menuOpen) return true;
+    tft.pushImage(offX + x, offY + y, w, h, bitmap);
+  }
   return true;
 }
 
@@ -319,6 +329,7 @@ void menuValue(int i, char *out, size_t n) {
     case M_SAT: snprintf(out, n, "< %d >", cfg.saturation); break;
     case M_MIRROR: snprintf(out, n, "%s", cfg.hmirror ? "on" : "off"); break;
     case M_FLIP: snprintf(out, n, "%s", cfg.vflip ? "on" : "off"); break;
+    case M_ROT: snprintf(out, n, "< %d deg >", viewRot * 90); break;
     case M_CROSS: snprintf(out, n, "%s", cfg.crosshair ? "on" : "off"); break;
     case M_CENTER_L: snprintf(out, n, "< %u us >", sc.centerL); break;
     case M_CENTER_R: snprintf(out, n, "< %u us >", sc.centerR); break;
@@ -334,12 +345,12 @@ void menuValue(int i, char *out, size_t n) {
   }
 }
 
-int menuVisRows() { return (tft.height() - (MENU_TOP + 4) - ROW_H) / ROW_H; }
+int menuVisRows() { return (tft.height() - (menuTop() + 4) - ROW_H) / ROW_H; }
 
 void drawMenu() {
   char val[24];
   int vis = menuVisRows();
-  int y = MENU_TOP + 4;
+  int y = menuTop() + 4;
   for (int r = 0; r < vis; r++, y += ROW_H) {
     int i = menuScroll + r;
     if (i >= MENU_ITEMS) break;
@@ -409,6 +420,11 @@ void changeValue(int item, int d, int mult) {
     case M_SAT: cfg.saturation = constrain(cfg.saturation + d, -2, 2); break;
     case M_MIRROR: cfg.hmirror ^= 1; break;
     case M_FLIP: cfg.vflip ^= 1; break;
+    case M_ROT:
+      viewRot = (viewRot + d + 4) & 3;
+      applyRotation();
+      imgW = 0;
+      break;
     case M_CROSS: cfg.crosshair ^= 1; break;
     case M_CENTER_L: sc.centerL = constrain((int)sc.centerL + d * 5 * mult, 1000, 2000); break;
     case M_CENTER_R: sc.centerR = constrain((int)sc.centerR + d * 5 * mult, 1000, 2000); break;
@@ -451,6 +467,7 @@ void menuInput(uint8_t b) {
   int vis = menuVisRows();
   if (menuSel < menuScroll) menuScroll = menuSel;
   if (menuSel >= menuScroll + vis) menuScroll = menuSel - vis + 1;
+  if (menuScroll > MENU_ITEMS - vis) menuScroll = max(0, MENU_ITEMS - vis);
   menuDirty = true;
 }
 
@@ -495,13 +512,13 @@ void drawFrame() {
     tft.fillScreen(TFT_BLACK);
     if (menuOpen) menuDirty = true;
   }
-#if VIEW_ROTATE
-  offX = (tft.width() - imgH) / 2;
-  offY = (tft.height() - imgW) / 2;
-#else
-  offX = (tft.width() - imgW) / 2;
-  offY = (tft.height() - imgH) / 2;
-#endif
+  if (portrait()) {
+    offX = (tft.width() - imgH) / 2;
+    offY = (tft.height() - imgW) / 2;
+  } else {
+    offX = (tft.width() - imgW) / 2;
+    offY = (tft.height() - imgH) / 2;
+  }
   TJpgDec.drawJpg(0, 0, jpg, jpg_len);
   if (!menuOpen) {
     if (cfg.crosshair) drawCrosshair();
@@ -519,8 +536,7 @@ void setup() {
   tft.init();
   tft.invertDisplay(true);
   tft.setSwapBytes(true);
-  tft.setRotation(VIEW_ROTATE ? 2 : 1);
-  tft.fillScreen(TFT_BLACK);
+  applyRotation();
 
   TJpgDec.setJpgScale(1);
   TJpgDec.setCallback(tftOutput);
