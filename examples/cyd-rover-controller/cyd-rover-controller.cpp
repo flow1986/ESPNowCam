@@ -1,7 +1,8 @@
 /**************************************************
  * CYD (ESP32-2432S028R) Rover Controller
- * Receives the ESP-NOW camera stream of one tank and sends drive
- * commands read from a PCF8574 I2C GPIO expander (CYD-GB buttons).
+ * Receives the camera stream of one tank and sends drive commands read
+ * from a PCF8574 I2C GPIO expander (CYD-GB buttons).
+ * Network mode (menu): ESP-NOW or WiFi (WebSocket to the tank, see the tank README).
  * This file is part ESPNowCam project:
  * https://github.com/hpsaturn/ESPNowCam
  *
@@ -11,11 +12,16 @@
  * START fire (held), START long: calibration mode (see below)
  * Calibration: UP/DOWN drive, LEFT/RIGHT trim until the tank drives straight, START long to leave
  * START+SELECT: config menu (UP/DOWN select, LEFT/RIGHT change, A scan/close, B close)
+ *
+ * Camera and servo settings are stored on the tank, the menu shows and edits the values of the tank.
 **************************************************/
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <WebSocketsClient.h>
 #include <esp_wifi.h>
 #include <TFT_eSPI.h>
 #include <TJpg_Decoder.h>
@@ -44,12 +50,13 @@
 #endif
 // trim change in permille per second while LEFT/RIGHT is held in calibration mode
 #define TRIM_RATE_PM_S 60
+#define WS_PORT 81
 
 // the menu is drawn below this line, above it the live image stays visible
 #define MENU_TOP 96
 #define ROW_H 18
 
-// calibration is stored per tank id
+// working copy of the tank settings (the tank stores them), per tank id
 struct ServoCfg {
   uint16_t centerL = 1500;
   uint16_t centerR = 1500;
@@ -77,11 +84,12 @@ struct Cfg {
 };
 
 ESPNowCam radio;
+WebSocketsClient wsc;
 TFT_eSPI tft;
 Preferences prefs;
 static Cfg cfg;
 
-// color settings in their own NVS key (not part of Cfg)
+// color settings of the tank
 struct ColorCfg {
   uint8_t wb = 0;
   uint8_t effect = 0;
@@ -89,23 +97,34 @@ struct ColorCfg {
 };
 static ColorCfg col;
 
-static uint8_t fb[40000];   // ESPNowCam receive buffer
-static uint8_t jpg[32000];  // frame copy for decoding outside of the radio callback
+// frame buffers, allocated at start (static DRAM is too small): fb = ESP-NOW receive buffer and the
+// assembly buffer of the WebSocket video chunks, jpg = frame copy for decoding outside of the radio callback
+#define FB_SIZE 40000
+#define JPG_SIZE 32000
+static uint8_t *fb = nullptr;
+static uint8_t *jpg = nullptr;
 static volatile uint32_t jpg_len = 0;
 static volatile bool frame_ready = false;
 static uint32_t lastFrameStamp = 0;
+static const char *lastNoMsg = nullptr;
 static bool noSignalDrawn = false;
 static int imgW = 0, imgH = 0, offX = 0, offY = 0;
+static uint32_t wsPos = 0;
+static bool wsOk = false;
 
-static SemaphoreHandle_t radioMutex;
+static SemaphoreHandle_t radioMutex;  // guards radio.sendData() and the WebSocket client
 static volatile uint8_t btnState = 0;
 static volatile uint8_t speedPct = SPEED_DEFAULT;
 static volatile bool calibMode = false;
+static volatile float gripF = 50, liftF = 50;
 static volatile int gripPct = 50, liftPct = 50;
 static volatile bool menuOpen = false;
 static volatile bool menuDirty = false;
 static volatile bool scanning = false;
-static volatile bool camDirty = true;
+static volatile uint32_t pushUntil = 0;  // the working copy is sent to the tank until this time
+static volatile bool synced = false;     // the settings of the tank were received
+static volatile bool gotCam = false, gotServo = false;
+static volatile bool posSyncPending = true;
 static volatile uint16_t foundMask = 0;
 static volatile uint32_t lastPong = 0;
 static char scanMsg[32] = "";
@@ -114,31 +133,53 @@ static int menuScroll = 0;
 
 // camera image rotation 0..3 = 0/90/180/270 degrees, the screen itself stays portrait
 static uint8_t viewRot = 1;
-// drive trim per tank in permille, own NVS keys (not part of Cfg)
+// drive trim per tank in permille (tank setting)
 static int16_t trimPm[RV_MAX_TANKS];
 
-#define MENU_ITEMS 26
+// network mode: 0 ESP-NOW, 1 WiFi (applied after a restart)
+static uint8_t netMode = 0;
+static bool modeChanged = false;
+static char wifiSsid[33] = "";
+static char wifiPass[65] = "";
+static volatile bool wsConnected = false;
+static bool wsStarted = false;
+static uint8_t wsTank = 0;
+static uint32_t wsStartMs = 0;
+static bool mdnsStarted = false;
+
+#define MENU_ITEMS 28
 enum MenuItem {
-  M_TANK, M_SCAN, M_RES, M_QUALITY, M_BRIGHT, M_CONTRAST, M_SAT, M_WB, M_EFFECT, M_AE, M_MIRROR, M_FLIP, M_ROT, M_CROSS,
-  M_CENTER_L, M_CENTER_R, M_REV_L, M_REV_R, M_TRIM, M_GRIP_MIN, M_GRIP_MAX, M_GRIP_REV, M_LIFT_MIN,
-  M_LIFT_MAX, M_LIFT_REV, M_CLOSE
+  M_TANK, M_SCAN, M_MODE, M_WIFI, M_RES, M_QUALITY, M_BRIGHT, M_CONTRAST, M_SAT, M_WB, M_EFFECT, M_AE,
+  M_MIRROR, M_FLIP, M_ROT, M_CROSS, M_CENTER_L, M_CENTER_R, M_REV_L, M_REV_R, M_TRIM, M_GRIP_MIN,
+  M_GRIP_MAX, M_GRIP_REV, M_LIFT_MIN, M_LIFT_MAX, M_LIFT_REV, M_CLOSE
 };
-static const char *labels[MENU_ITEMS] = {"Tank",           "Scan tanks",      "Resolution",   "JPEG quality",
-                                         "Brightness",     "Contrast",        "Saturation",   "White balance", "Effect", "Exposure", "Mirror",
-                                         "Flip",           "Image rotation",  "Crosshair",    "Servo L center",
-                                         "Servo R center", "Servo L reverse", "Servo R reverse", "Drive trim",
-                                         "Grip min",       "Grip max",        "Grip reverse", "Lift min",
-                                         "Lift max",       "Lift reverse",    "Close"};
+static const char *labels[MENU_ITEMS] = {
+    "Tank",       "Scan tanks",     "Network mode",   "WiFi setup",     "Resolution",   "JPEG quality",
+    "Brightness", "Contrast",       "Saturation",     "White balance",  "Effect",       "Exposure",
+    "Mirror",     "Flip",           "Image rotation", "Crosshair",      "Servo L center", "Servo R center",
+    "Servo L reverse", "Servo R reverse", "Drive trim", "Grip min",     "Grip max",     "Grip reverse",
+    "Lift min",   "Lift max",       "Lift reverse",   "Close"};
 static const char *sizeNames[3] = {"160x120", "240x176", "320x240"};
 static const char *wbNames[5] = {"Auto", "Sunny", "Cloudy", "Office", "Home"};
 static const char *effectNames[7] = {"None", "Negative", "Grayscale", "Red", "Green", "Blue", "Sepia"};
 // measured at the display, shown in the menu and the HUD to tune quality against latency
 static uint32_t fpsNow = 0, avgBytes = 0;
 
-bool tankOnline() { return millis() - lastPong < 2000 || millis() - lastFrameStamp < 2000; }
+bool tankOnline() {
+  bool link = (netMode == 0) || wsConnected;
+  return link && (millis() - lastPong < 2000 || millis() - lastFrameStamp < 2000);
+}
 
 int tankIdx() { return constrain(cfg.tank, 1, RV_MAX_TANKS) - 1; }
 ServoCfg &curServo() { return cfg.sv[tankIdx()]; }
+
+void markChanged() { pushUntil = millis() + 1500; }
+
+void resetSync() {
+  synced = false;
+  gotCam = false;
+  gotServo = false;
+}
 
 void trimText(int16_t t, char *out, size_t n) {
   snprintf(out, n, "%c%d.%d%%", t < 0 ? '-' : '+', abs(t) / 10, abs(t) % 10);
@@ -159,6 +200,9 @@ void loadCfg() {
     snprintf(key, sizeof(key), "trim%d", i + 1);
     trimPm[i] = prefs.getShort(key, 0);
   }
+  netMode = prefs.getUChar("mode", 0) & 1;
+  prefs.getString("ssid", "").toCharArray(wifiSsid, sizeof(wifiSsid));
+  prefs.getString("pass", "").toCharArray(wifiPass, sizeof(wifiPass));
   // one-time: the former default quality 15 maps to a very low JPEG quality (grey, washed out colors)
   if (prefs.getUChar("ver", 0) < 2) {
     cfg.quality = 40;
@@ -176,34 +220,122 @@ void saveCfg() {
     snprintf(key, sizeof(key), "trim%d", i + 1);
     prefs.putShort(key, trimPm[i]);
   }
+  prefs.putUChar("mode", netMode);
+  prefs.putString("ssid", wifiSsid);
+  prefs.putString("pass", wifiPass);
 }
 
 void sendPacket(const void *p, size_t n) {
   xSemaphoreTake(radioMutex, portMAX_DELAY);
-  radio.sendData((uint8_t *)p, n);
+  if (netMode == 1) {
+    if (wsConnected) wsc.sendBIN((uint8_t *)p, n);
+  } else {
+    radio.sendData((uint8_t *)p, n);
+  }
   xSemaphoreGive(radioMutex);
 }
 
 void applyChannel(uint8_t ch) {
+  if (netMode != 0) return;
   xSemaphoreTake(radioMutex, portMAX_DELAY);
   esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
   xSemaphoreGive(radioMutex);
 }
 
-// runs in the WiFi task, so only copy the frame here
-void onRecv(uint32_t length) {
-  if (length >= sizeof(RvHdr) && fb[0] == RV_MAGIC) {
-    const RvHdr *h = (const RvHdr *)fb;
+void deliverFrame(uint32_t len) {
+  if (frame_ready || len > JPG_SIZE) return;
+  memcpy(jpg, fb, len);
+  jpg_len = len;
+  frame_ready = true;
+}
+
+// ESP-NOW callback (WiFi task) and WebSocket events (control task): only copy and set flags here
+void handleIncoming(const uint8_t *d, uint32_t len) {
+  if (len < 1) return;
+  if (d[0] == RV_MAGIC) {
+    if (len < sizeof(RvHdr)) return;
+    const RvHdr *h = (const RvHdr *)d;
     if (h->type == RV_PONG && h->tank >= 1 && h->tank <= RV_MAX_TANKS) {
       foundMask |= 1 << h->tank;
-      if (h->tank == cfg.tank) lastPong = millis();
+      if (h->tank == cfg.tank) {
+        lastPong = millis();
+        if (posSyncPending && len >= sizeof(RvPong)) {
+          gripF = d[3];
+          liftF = d[4];
+          posSyncPending = false;
+        }
+      }
+    } else if (h->tank == cfg.tank) {
+      if (h->type == RV_CAM && len >= sizeof(RvCam)) {
+        RvCam c;
+        memcpy(&c, d, sizeof(c));
+        cfg.size = constrain(c.size, 0, 2);
+        cfg.quality = c.quality;
+        cfg.brightness = c.brightness;
+        cfg.contrast = c.contrast;
+        cfg.saturation = c.saturation;
+        cfg.hmirror = c.hmirror;
+        cfg.vflip = c.vflip;
+        col.wb = c.wb;
+        col.effect = c.effect;
+        col.ae = c.aeLevel;
+        gotCam = true;
+      } else if (h->type == RV_SERVO && len >= sizeof(RvServo)) {
+        RvServo s;
+        memcpy(&s, d, sizeof(s));
+        ServoCfg &sc = cfg.sv[tankIdx()];
+        sc.centerL = s.centerL;
+        sc.centerR = s.centerR;
+        sc.gripMin = s.gripMin;
+        sc.gripMax = s.gripMax;
+        sc.liftMin = s.liftMin;
+        sc.liftMax = s.liftMax;
+        sc.gripRev = s.gripRev;
+        sc.liftRev = s.liftRev;
+        sc.revL = s.revL;
+        sc.revR = s.revR;
+        trimPm[tankIdx()] = s.trim;
+        gotServo = true;
+      }
+      synced = gotCam && gotServo;
+      menuDirty = true;
     }
     return;
   }
-  if (frame_ready || length > sizeof(jpg)) return;
-  memcpy(jpg, fb, length);
-  jpg_len = length;
-  frame_ready = true;
+  if (d[0] == 0xFE && len >= 2) {  // WebSocket video chunk
+    uint8_t fl = d[1];
+    if (fl & 1) {
+      wsPos = 0;
+      wsOk = true;
+    }
+    if (!wsOk || wsPos + len - 2 > FB_SIZE) {
+      wsOk = false;
+      return;
+    }
+    memcpy(fb + wsPos, d + 2, len - 2);
+    wsPos += len - 2;
+    if (fl & 2) {
+      deliverFrame(wsPos);
+      wsOk = false;
+    }
+    return;
+  }
+  deliverFrame(len);  // ESP-NOW: the whole frame is in fb
+}
+
+void onRecv(uint32_t length) { handleIncoming(fb, length); }
+
+void wsEvent(WStype_t type, uint8_t *payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      wsConnected = true;
+      resetSync();
+      posSyncPending = true;
+      break;
+    case WStype_DISCONNECTED: wsConnected = false; break;
+    case WStype_BIN: handleIncoming(payload, length); break;
+    default: break;
+  }
 }
 
 bool tftOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
@@ -256,129 +388,145 @@ uint8_t servoPreview() {
   }
 }
 
+void pushSettings() {
+  ServoCfg &sc = curServo();
+  RvCam c = {{RV_MAGIC, RV_CAM, cfg.tank}, cfg.size,       cfg.quality, cfg.brightness, cfg.contrast,
+             cfg.saturation,               cfg.hmirror,    cfg.vflip,   col.wb,         col.effect,
+             col.ae};
+  sendPacket(&c, sizeof(c));
+  RvServo s = {{RV_MAGIC, RV_SERVO, cfg.tank}, sc.centerL, sc.centerR, sc.gripMin, sc.gripMax,
+               sc.liftMin,                     sc.liftMax, sc.gripRev, sc.liftRev,  sc.revL,
+               sc.revR,                        trimPm[tankIdx()],      servoPreview()};
+  sendPacket(&s, sizeof(s));
+}
+
 void controlTask(void *arg) {
   uint8_t prev = 0;
   bool selArmed = false, selUsed = false, startLong = false, suppress = false, comboPrev = false;
   int8_t lastFwd = 0, lastTurn = 0;
   uint8_t lastFire = 0, lastGrip = 255, lastLift = 255;
-  uint32_t lastSend = 0, lastCam = 0, lastPing = 0, lastServoSend = 0, startDown = 0, lastTick = millis();
-  float gp = gripPct, lp = liftPct;
-  RvServo lastServo;
-  memset(&lastServo, 0, sizeof(lastServo));
+  uint32_t lastSend = 0, lastPing = 0, lastGet = 0, lastPush = 0, startDown = 0, lastLogic = 0,
+           lastTick = millis();
 
   for (;;) {
-    uint8_t b = readButtons();
-    btnState = b;
-    uint8_t pressed = b & ~prev;
-    uint8_t released = prev & ~b;
-    prev = b;
     uint32_t now = millis();
-    float dt = (now - lastTick) / 1000.0f;
-    lastTick = now;
-
-    bool combo = (b & BTN_START) && (b & BTN_SELECT);
-    if (combo && !comboPrev) {
-      menuOpen = !menuOpen;
-      menuDirty = true;
-      calibMode = false;
-    }
-    comboPrev = combo;
-
-    // select alone: short press cycles the speed, held with A/B it moves the lift
-    if (pressed & BTN_SELECT) {
-      selArmed = true;
-      selUsed = false;
-    }
-    if (combo) selArmed = false;
-    bool selHeld = (b & BTN_SELECT) && selArmed;
-    if (selHeld && (b & (BTN_A | BTN_B))) selUsed = true;
-    if (released & BTN_SELECT) {
-      if (selArmed && !selUsed && !menuOpen && !suppress) speedPct = (speedPct >= 100) ? 25 : speedPct + 25;
-      selArmed = false;
+    if (netMode == 1) {
+      xSemaphoreTake(radioMutex, portMAX_DELAY);
+      wsc.loop();
+      xSemaphoreGive(radioMutex);
     }
 
-    // start alone: fire while held, a long press toggles the calibration mode
-    if (pressed & BTN_START) {
-      startDown = now;
-      startLong = false;
-    }
-    bool startOnly = (b & BTN_START) && !(b & BTN_SELECT);
-    if (startOnly && !startLong && now - startDown >= START_LONG_MS && !menuOpen && !suppress) {
-      calibMode = !calibMode;
-      startLong = true;
-    }
-    if (released & BTN_START) startLong = false;
+    if (now - lastLogic >= 20) {
+      lastLogic = now;
+      uint8_t b = readButtons();
+      btnState = b;
+      uint8_t pressed = b & ~prev;
+      uint8_t released = prev & ~b;
+      prev = b;
+      float dt = (now - lastTick) / 1000.0f;
+      lastTick = now;
 
-    // after closing the menu ignore the keys until they are released
-    if (menuOpen) suppress = true;
-    else if (suppress && !(b & 0x3F)) suppress = false;
+      bool combo = (b & BTN_START) && (b & BTN_SELECT);
+      if (combo && !comboPrev) {
+        menuOpen = !menuOpen;
+        menuDirty = true;
+        calibMode = false;
+      }
+      comboPrev = combo;
 
-    int8_t fwd = 0, turn = 0;
-    uint8_t fire = 0;
-    if (!menuOpen && !suppress) {
-      int s = speedPct;
-      fire = startOnly && !startLong && now - startDown < START_LONG_MS;
-      fwd = ((b & BTN_UP) ? s : 0) - ((b & BTN_DOWN) ? s : 0);
-      if (calibMode) {
-        // RIGHT = the tank should steer more to the right
-        float step = TRIM_RATE_PM_S * dt;
-        float t = trimPm[tankIdx()];
-        if (b & BTN_RIGHT) t += step;
-        if (b & BTN_LEFT) t -= step;
-        trimPm[tankIdx()] = (int16_t)lroundf(constrain(t, -400.0f, 400.0f));
-      } else {
-        turn = ((b & BTN_RIGHT) ? s : 0) - ((b & BTN_LEFT) ? s : 0);
-        float step = GRIP_RATE_PCT_S * dt;
-        if (selHeld) {
-          if (b & BTN_A) lp += step;
-          if (b & BTN_B) lp -= step;
+      // select alone: short press cycles the speed, held with A/B it moves the lift
+      if (pressed & BTN_SELECT) {
+        selArmed = true;
+        selUsed = false;
+      }
+      if (combo) selArmed = false;
+      bool selHeld = (b & BTN_SELECT) && selArmed;
+      if (selHeld && (b & (BTN_A | BTN_B))) selUsed = true;
+      if (released & BTN_SELECT) {
+        if (selArmed && !selUsed && !menuOpen && !suppress) speedPct = (speedPct >= 100) ? 25 : speedPct + 25;
+        selArmed = false;
+      }
+
+      // start alone: fire while held, a long press toggles the calibration mode
+      if (pressed & BTN_START) {
+        startDown = now;
+        startLong = false;
+      }
+      bool startOnly = (b & BTN_START) && !(b & BTN_SELECT);
+      if (startOnly && !startLong && now - startDown >= START_LONG_MS && !menuOpen && !suppress) {
+        calibMode = !calibMode;
+        startLong = true;
+        markChanged();
+      }
+      if (released & BTN_START) startLong = false;
+
+      // after closing the menu ignore the keys until they are released
+      if (menuOpen) suppress = true;
+      else if (suppress && !(b & 0x3F)) suppress = false;
+
+      int8_t fwd = 0, turn = 0;
+      uint8_t fire = 0;
+      if (!menuOpen && !suppress) {
+        int s = speedPct;
+        fire = startOnly && !startLong && now - startDown < START_LONG_MS;
+        fwd = ((b & BTN_UP) ? s : 0) - ((b & BTN_DOWN) ? s : 0);
+        if (calibMode) {
+          // RIGHT = the tank should steer more to the right
+          float step = TRIM_RATE_PM_S * dt;
+          float t = trimPm[tankIdx()];
+          if (b & BTN_RIGHT) t += step;
+          if (b & BTN_LEFT) t -= step;
+          trimPm[tankIdx()] = (int16_t)lroundf(constrain(t, -400.0f, 400.0f));
+          if (b & (BTN_LEFT | BTN_RIGHT)) markChanged();
         } else {
-          if (b & BTN_A) gp += step;
-          if (b & BTN_B) gp -= step;
+          turn = ((b & BTN_RIGHT) ? s : 0) - ((b & BTN_LEFT) ? s : 0);
+          float step = GRIP_RATE_PCT_S * dt;
+          float gp = gripF, lp = liftF;
+          if (selHeld) {
+            if (b & BTN_A) lp += step;
+            if (b & BTN_B) lp -= step;
+          } else {
+            if (b & BTN_A) gp += step;
+            if (b & BTN_B) gp -= step;
+          }
+          gripF = constrain(gp, 0.0f, 100.0f);
+          liftF = constrain(lp, 0.0f, 100.0f);
         }
-        gp = constrain(gp, 0.0f, 100.0f);
-        lp = constrain(lp, 0.0f, 100.0f);
-        gripPct = (int)(gp + 0.5f);
-        liftPct = (int)(lp + 0.5f);
       }
-    }
+      gripPct = (int)(gripF + 0.5f);
+      liftPct = (int)(liftF + 0.5f);
 
-    if (!scanning) {
-      // keep-alive: the tank stops if commands are missing
-      if (fwd != lastFwd || turn != lastTurn || fire != lastFire || gripPct != lastGrip || liftPct != lastLift ||
-          now - lastSend > 100) {
-        RvDrive d = {{RV_MAGIC, RV_DRIVE, cfg.tank}, fwd, turn, fire, (uint8_t)gripPct, (uint8_t)liftPct};
-        sendPacket(&d, sizeof(d));
-        lastFwd = fwd;
-        lastTurn = turn;
-        lastFire = fire;
-        lastGrip = gripPct;
-        lastLift = liftPct;
-        lastSend = now;
-      }
-      if (camDirty || now - lastCam > 1000) {
-        camDirty = false;
-        RvCam c = {{RV_MAGIC, RV_CAM, cfg.tank}, cfg.size,       cfg.quality, cfg.brightness,
-                   cfg.contrast,                 cfg.saturation, cfg.hmirror, cfg.vflip, col.wb, col.effect, col.ae};
-        sendPacket(&c, sizeof(c));
-        lastCam = now;
-      }
-      // calibration: sent at once on every change, otherwise once per second
-      ServoCfg &sc = curServo();
-      RvServo s = {{RV_MAGIC, RV_SERVO, cfg.tank}, sc.centerL, sc.centerR, sc.gripMin, sc.gripMax, sc.liftMin,
-                   sc.liftMax, sc.gripRev, sc.liftRev, sc.revL, sc.revR, trimPm[tankIdx()], servoPreview()};
-      if (memcmp(&s, &lastServo, sizeof(s)) != 0 || now - lastServoSend > 1000) {
-        sendPacket(&s, sizeof(s));
-        lastServo = s;
-        lastServoSend = now;
-      }
-      if (now - lastPing > 500) {
-        RvHdr p = {RV_MAGIC, RV_PING, cfg.tank};
-        sendPacket(&p, sizeof(p));
-        lastPing = now;
+      if (!scanning) {
+        // keep-alive: the tank stops if commands are missing
+        if (fwd != lastFwd || turn != lastTurn || fire != lastFire || gripPct != lastGrip || liftPct != lastLift ||
+            now - lastSend > 100) {
+          RvDrive d = {{RV_MAGIC, RV_DRIVE, cfg.tank}, fwd, turn, fire, (uint8_t)gripPct, (uint8_t)liftPct};
+          sendPacket(&d, sizeof(d));
+          lastFwd = fwd;
+          lastTurn = turn;
+          lastFire = fire;
+          lastGrip = gripPct;
+          lastLift = liftPct;
+          lastSend = now;
+        }
+        // load the settings of the tank first, only then the working copy may be sent back
+        if (!synced && now - lastGet > 700) {
+          RvHdr g = {RV_MAGIC, RV_GETCFG, cfg.tank};
+          sendPacket(&g, sizeof(g));
+          lastGet = now;
+        }
+        if (synced && (now < pushUntil || (menuOpen && servoPreview())) && now - lastPush >= 250) {
+          pushSettings();
+          lastPush = now;
+        }
+        if (now - lastPing > 500) {
+          RvHdr p = {RV_MAGIC, RV_PING, cfg.tank};
+          sendPacket(&p, sizeof(p));
+          lastPing = now;
+        }
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
@@ -387,7 +535,11 @@ void menuValue(int i, char *out, size_t n) {
   switch (i) {
     case M_TANK: snprintf(out, n, "< %u > %s", cfg.tank, tankOnline() ? "ONLINE" : "offline"); break;
     case M_SCAN: snprintf(out, n, "A = scan"); break;
-    case M_RES: snprintf(out, n, "< %s >", sizeNames[cfg.size]); break;
+    case M_MODE: snprintf(out, n, "< %s >", netMode ? "WiFi" : "ESP-NOW"); break;
+    case M_WIFI:
+      snprintf(out, n, "%s", netMode ? (WiFi.status() == WL_CONNECTED ? "online, A = setup" : "A = setup") : "WiFi mode first");
+      break;
+    case M_RES: snprintf(out, n, "< %s >", sizeNames[cfg.size % 3]); break;
     case M_QUALITY: snprintf(out, n, "< %u >", cfg.quality); break;
     case M_BRIGHT: snprintf(out, n, "< %d >", cfg.brightness); break;
     case M_CONTRAST: snprintf(out, n, "< %d >", cfg.contrast); break;
@@ -431,7 +583,7 @@ void drawMenuStatus() {
   uint32_t kb10 = avgBytes * 10 / 1024;
   snprintf(val, sizeof(val), "%ufps %u.%uKB", (unsigned)fpsNow, (unsigned)(kb10 / 10), (unsigned)(kb10 % 10));
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.drawString(val, 100, y + 1, 2);
+  tft.drawString(val, 130, y + 1, 2);
   snprintf(val, sizeof(val), "%d/%d", menuSel + 1, MENU_ITEMS);
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
   tft.setTextDatum(TR_DATUM);
@@ -457,19 +609,204 @@ void drawMenu() {
   drawMenuStatus();
 }
 
+// key events with auto repeat for the direction keys, shared by the menu and the setup screens
+uint8_t keyEvents(uint8_t b, int *mult) {
+  static uint8_t prev = 0;
+  static uint32_t holdStart = 0, lastRepeat = 0;
+  const uint8_t dirs = BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT;
+  uint32_t now = millis();
+  uint8_t ev = b & ~prev;
+  *mult = 1;
+  if (ev & dirs) {
+    holdStart = lastRepeat = now;
+  } else if ((b & dirs) && now - holdStart > 400 && now - lastRepeat > 120) {
+    ev |= b & dirs;
+    lastRepeat = now;
+    *mult = 4;
+  }
+  prev = b;
+  return ev;
+}
+
+/***********************************
+ * WiFi setup screens (blocking, called from the menu)
+************************************/
+void uiTitle(const char *t) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  tft.drawString(t, 4, 4, 2);
+}
+
+// UP/DOWN change the character, RIGHT = next (adds a character), LEFT = back, B = delete, A = OK, SELECT = cancel
+bool editText(const char *title, char *buf, size_t cap) {
+  static const char cs[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -_.!@#$%&*+=?/:;,()[]{}<>~^'\"\\|`";
+  const int csn = sizeof(cs) - 1;
+  size_t len = strlen(buf), pos = len;
+  char pend = 'a';
+  bool redraw = true;
+  for (;;) {
+    int mult;
+    uint8_t ev = keyEvents(btnState, &mult);
+    if (ev & BTN_SELECT) return false;
+    if (ev & BTN_A) return true;
+    char *cur = (pos < len) ? &buf[pos] : &pend;
+    if (ev & (BTN_UP | BTN_DOWN)) {
+      const char *f = strchr(cs, *cur);
+      int i = f ? (int)(f - cs) : 0;
+      i = (i + ((ev & BTN_UP) ? 1 : csn - 1)) % csn;
+      *cur = cs[i];
+      redraw = true;
+    }
+    if (ev & BTN_RIGHT) {
+      if (pos == len) {
+        if (len + 1 < cap) {
+          buf[len++] = pend;
+          buf[len] = 0;
+          pos = len;
+        }
+      } else {
+        pos++;
+      }
+      redraw = true;
+    }
+    if ((ev & BTN_LEFT) && pos > 0) {
+      pos--;
+      redraw = true;
+    }
+    if ((ev & BTN_B) && pos > 0) {
+      memmove(buf + pos - 1, buf + pos, len - pos + 1);
+      len--;
+      pos--;
+      redraw = true;
+    }
+    if (redraw) {
+      redraw = false;
+      uiTitle(title);
+      for (size_t i = 0; i <= len; i++) {
+        if (i == len && pos != len) continue;  // the new character is only shown at the cursor
+        char c = (i < len) ? buf[i] : pend;
+        bool at = (i == pos);
+        tft.drawChar(4 + (i % 19) * 12, 30 + (i / 19) * 20, c, TFT_WHITE, at ? TFT_BLUE : TFT_BLACK, 2);
+      }
+      tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      tft.drawString("UP/DOWN char, RIGHT next, LEFT back", 4, 200, 1);
+      tft.drawString("B delete, A ok, SELECT cancel", 4, 212, 1);
+    }
+    delay(10);
+  }
+}
+
+int pickNetwork(int n) {
+  int sel = 0, scroll = 0;
+  const int rows = (tft.height() - 28) / ROW_H;
+  bool redraw = true;
+  for (;;) {
+    int mult;
+    uint8_t ev = keyEvents(btnState, &mult);
+    if (ev & BTN_B) return -1;
+    if (ev & BTN_A) return sel;
+    if (ev & BTN_UP) {
+      sel = (sel + n - 1) % n;
+      redraw = true;
+    }
+    if (ev & BTN_DOWN) {
+      sel = (sel + 1) % n;
+      redraw = true;
+    }
+    if (redraw) {
+      redraw = false;
+      if (sel < scroll) scroll = sel;
+      if (sel >= scroll + rows) scroll = sel - rows + 1;
+      uiTitle("WiFi: UP/DOWN, A ok, B cancel");
+      for (int r = 0; r < rows && scroll + r < n; r++) {
+        int i = scroll + r, y = 26 + r * ROW_H;
+        uint16_t bg = (i == sel) ? TFT_NAVY : TFT_BLACK;
+        tft.fillRect(0, y, tft.width(), ROW_H, bg);
+        tft.setTextColor(TFT_WHITE, bg);
+        tft.setTextDatum(TL_DATUM);
+        String name = WiFi.SSID(i);
+        if (name.length() > 20) name = name.substring(0, 20);
+        tft.drawString(name, 4, y + 1, 2);
+        char info[12];
+        snprintf(info, sizeof(info), "%s%d", WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "" : "* ", (int)WiFi.RSSI(i));
+        tft.setTextDatum(TR_DATUM);
+        tft.drawString(info, tft.width() - 4, y + 1, 2);
+      }
+    }
+    delay(10);
+  }
+}
+
+void wifiSetup() {
+  if (netMode != 1) {
+    snprintf(scanMsg, sizeof(scanMsg), "Mode WiFi + restart");
+    return;
+  }
+  scanning = true;
+  uiTitle("Scanning WiFi...");
+  int n = WiFi.scanNetworks();
+  if (n <= 0) {
+    snprintf(scanMsg, sizeof(scanMsg), "No WiFi found");
+  } else {
+    int idx = pickNetwork(n);
+    if (idx >= 0) {
+      String ssid = WiFi.SSID(idx);
+      bool open = WiFi.encryptionType(idx) == WIFI_AUTH_OPEN;
+      char pass[65] = "";
+      if (ssid == wifiSsid) strlcpy(pass, wifiPass, sizeof(pass));
+      bool ok = open || editText("WiFi password", pass, sizeof(pass));
+      if (ok) {
+        uiTitle("Connecting...");
+        WiFi.disconnect();
+        WiFi.begin(ssid.c_str(), pass);
+        uint32_t t0 = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) delay(200);
+        if (WiFi.status() == WL_CONNECTED) {
+          strlcpy(wifiSsid, ssid.c_str(), sizeof(wifiSsid));
+          strlcpy(wifiPass, pass, sizeof(wifiPass));
+          saveCfg();
+          wsStarted = false;
+          snprintf(scanMsg, sizeof(scanMsg), "OK %s", WiFi.localIP().toString().c_str());
+        } else {
+          snprintf(scanMsg, sizeof(scanMsg), "Connect failed");
+          if (wifiSsid[0]) WiFi.begin(wifiSsid, wifiPass);
+        }
+      }
+    }
+  }
+  WiFi.scanDelete();
+  scanning = false;
+  tft.fillScreen(TFT_BLACK);
+  menuDirty = true;
+}
+
+/***********************************
+ * Tank search and connection
+************************************/
 void scanTanks() {
   scanning = true;
   foundMask = 0;
   snprintf(scanMsg, sizeof(scanMsg), "Scanning...");
-  drawMenu();
-  RvHdr ping = {RV_MAGIC, RV_PING, 0};
-  for (uint8_t ch = 1; ch <= RV_MAX_TANKS; ch++) {
-    applyChannel(ch);
-    for (int k = 0; k < 2; k++) {
-      sendPacket(&ping, sizeof(ping));
-      delay(70);
+  drawMenuStatus();
+  if (netMode == 0) {
+    RvHdr ping = {RV_MAGIC, RV_PING, 0};
+    for (uint8_t ch = 1; ch <= RV_MAX_TANKS; ch++) {
+      applyChannel(ch);
+      for (int k = 0; k < 2; k++) {
+        sendPacket(&ping, sizeof(ping));
+        delay(70);
+      }
+      delay(60);
     }
-    delay(60);
+  } else if (WiFi.status() == WL_CONNECTED) {
+    if (!mdnsStarted) mdnsStarted = MDNS.begin("rovercyd");
+    for (int t = 1; t <= RV_MAX_TANKS; t++) {
+      char host[24];
+      snprintf(host, sizeof(host), "rovertank%d", t);
+      if ((uint32_t)MDNS.queryHost(host, 500) != 0) foundMask |= 1 << t;
+    }
   }
   uint16_t mask = foundMask;
   int n = snprintf(scanMsg, sizeof(scanMsg), "Found:");
@@ -484,9 +821,51 @@ void scanTanks() {
         break;
       }
   applyChannel(cfg.tank);
+  wsStarted = false;
   lastPong = 0;
-  camDirty = true;
+  resetSync();
+  posSyncPending = true;
   scanning = false;
+}
+
+void tankChanged() {
+  lastPong = 0;
+  resetSync();
+  posSyncPending = true;
+  if (netMode == 0) {
+    applyChannel(cfg.tank);
+  } else {
+    xSemaphoreTake(radioMutex, portMAX_DELAY);
+    wsc.disconnect();
+    xSemaphoreGive(radioMutex);
+    wsStarted = false;
+  }
+}
+
+// WiFi mode: find the tank by its mDNS name and open the WebSocket
+void wifiService() {
+  static uint32_t lastTry = 0;
+  if (netMode != 1 || scanning) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (wsStarted && wsTank == cfg.tank) {
+    // the tank may have got another IP: look it up again
+    if (!wsConnected && millis() - wsStartMs > 10000) wsStarted = false;
+    return;
+  }
+  if (millis() - lastTry < 4000) return;
+  lastTry = millis();
+  if (!mdnsStarted) mdnsStarted = MDNS.begin("rovercyd");
+  char host[24];
+  snprintf(host, sizeof(host), "rovertank%u", cfg.tank);
+  IPAddress ip = MDNS.queryHost(host, 1500);
+  if ((uint32_t)ip == 0) return;
+  xSemaphoreTake(radioMutex, portMAX_DELAY);
+  wsc.disconnect();
+  wsc.begin(ip.toString().c_str(), WS_PORT, "/");
+  xSemaphoreGive(radioMutex);
+  wsStarted = true;
+  wsTank = cfg.tank;
+  wsStartMs = millis();
 }
 
 // mult > 1 while the key is held (repeat), for the microsecond values
@@ -495,8 +874,12 @@ void changeValue(int item, int d, int mult) {
   switch (item) {
     case M_TANK:
       cfg.tank = (cfg.tank - 1 + d + RV_MAX_TANKS) % RV_MAX_TANKS + 1;
-      applyChannel(cfg.tank);
-      lastPong = 0;
+      tankChanged();
+      break;
+    case M_MODE:
+      netMode ^= 1;
+      modeChanged = true;
+      snprintf(scanMsg, sizeof(scanMsg), "Restart on close");
       break;
     case M_RES: cfg.size = constrain(cfg.size + d, 0, 2); break;
     case M_QUALITY: cfg.quality = constrain(cfg.quality + 5 * d, 5, 50); break;
@@ -526,24 +909,13 @@ void changeValue(int item, int d, int mult) {
     case M_LIFT_MAX: sc.liftMax = constrain((int)sc.liftMax + d * 10 * mult, 500, 2500); break;
     case M_LIFT_REV: sc.liftRev ^= 1; break;
   }
-  if (item <= M_FLIP) camDirty = true;
+  // everything but the tank choice, the network and the view settings is stored on the tank
+  if ((item >= M_RES && item <= M_FLIP) || (item >= M_CENTER_L && item <= M_LIFT_REV)) markChanged();
 }
 
 void menuInput(uint8_t b) {
-  static uint8_t prev = 0;
-  static uint32_t holdStart = 0, lastRepeat = 0;
-  const uint8_t dirs = BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT;
-  uint32_t now = millis();
-  uint8_t ev = b & ~prev;
-  int mult = 1;
-  if (ev & dirs) {
-    holdStart = lastRepeat = now;
-  } else if ((b & dirs) && now - holdStart > 400 && now - lastRepeat > 120) {
-    ev |= b & dirs;
-    lastRepeat = now;
-    mult = 4;
-  }
-  prev = b;
+  int mult;
+  uint8_t ev = keyEvents(b, &mult);
   if (!ev) return;
 
   if (ev & BTN_UP) menuSel = (menuSel + MENU_ITEMS - 1) % MENU_ITEMS;
@@ -551,6 +923,7 @@ void menuInput(uint8_t b) {
   if (ev & BTN_LEFT) changeValue(menuSel, -1, mult);
   if (ev & BTN_RIGHT) changeValue(menuSel, 1, mult);
   if ((ev & BTN_A) && menuSel == M_SCAN) scanTanks();
+  if ((ev & BTN_A) && menuSel == M_WIFI) wifiSetup();
   if (((ev & BTN_A) && menuSel == M_CLOSE) || (ev & BTN_B)) menuOpen = false;
 
   int vis = menuVisRows();
@@ -589,11 +962,20 @@ void drawHud() {
   tft.drawString(s, 2, 12, 1);
 }
 
-void drawNoSignal() {
+const char *noSignalMsg() {
+  if (netMode == 1) {
+    if (!wifiSsid[0]) return "NO WIFI SET (MENU)";
+    if (WiFi.status() != WL_CONNECTED) return "WIFI CONNECTING...";
+    if (!wsConnected) return "SEARCHING TANK...";
+  }
+  return "NO CAMERA SIGNAL";
+}
+
+void drawNoSignal(const char *msg) {
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_RED, TFT_BLACK);
   tft.setTextDatum(MC_DATUM);
-  tft.drawString("NO CAMERA SIGNAL", tft.width() / 2, tft.height() / 2, 2);
+  tft.drawString(msg, tft.width() / 2, tft.height() / 2, 2);
 }
 
 void drawFrame() {
@@ -619,6 +1001,9 @@ void drawFrame() {
 
 void setup() {
   Serial.begin(115200);
+  fb = (uint8_t *)malloc(FB_SIZE);
+  jpg = (uint8_t *)malloc(JPG_SIZE);
+  if (!fb || !jpg) Serial.println("Frame buffer allocation failed");
   loadCfg();
   radioMutex = xSemaphoreCreateMutex();
 
@@ -639,13 +1024,25 @@ void setup() {
   Wire.write(0xFF);  // all pins as inputs
   Wire.endTransmission();
 
-  radio.setRecvBuffer(fb);
-  radio.setRecvCallback(onRecv);
-  if (radio.init()) Serial.println("ESPNow Init Success");
-  applyChannel(cfg.tank);
+  if (netMode == 1) {
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.setAutoReconnect(true);
+    if (wifiSsid[0]) WiFi.begin(wifiSsid, wifiPass);
+    wsc.onEvent(wsEvent);
+    wsc.setReconnectInterval(2000);
+    wsc.enableHeartbeat(4000, 2000, 2);
+  } else {
+    radio.setRecvBuffer(fb);
+    radio.setRecvCallback(onRecv);
+    if (radio.init()) Serial.println("ESPNow Init Success");
+    applyChannel(cfg.tank);
+  }
 
-  xTaskCreatePinnedToCore(controlTask, "ctrl", 4096, NULL, 2, NULL, 0);
-  drawNoSignal();
+  xTaskCreatePinnedToCore(controlTask, "ctrl", 8192, NULL, 2, NULL, 0);
+  lastNoMsg = noSignalMsg();
+  drawNoSignal(lastNoMsg);
   noSignalDrawn = true;
   lastFrameStamp = millis();
 }
@@ -659,13 +1056,23 @@ void loop() {
     if (menuOpen) {
       menuDirty = true;
       scanMsg[0] = 0;
-    } else saveCfg();
+      resetSync();  // load the current settings of the tank first
+    } else {
+      markChanged();
+      saveCfg();
+      if (modeChanged) {
+        delay(200);
+        ESP.restart();
+      }
+    }
   }
   // store the trim when the calibration mode is left
   if (calibMode != calibShown) {
     calibShown = calibMode;
     if (!calibMode) saveCfg();
   }
+
+  wifiService();
 
   if (menuOpen) {
     menuInput(btnState);
@@ -682,9 +1089,13 @@ void loop() {
     frame_ready = false;
     lastFrameStamp = millis();
     noSignalDrawn = false;
-  } else if (!menuOpen && !noSignalDrawn && millis() - lastFrameStamp > 2000) {
-    drawNoSignal();
-    noSignalDrawn = true;
+  } else if (!menuOpen && millis() - lastFrameStamp > 2000) {
+    const char *m = noSignalMsg();
+    if (!noSignalDrawn || m != lastNoMsg) {
+      lastNoMsg = m;
+      drawNoSignal(m);
+      noSignalDrawn = true;
+    }
   }
   uint32_t nowMs = millis();
   if (nowMs - fpsStamp >= 1000) {
