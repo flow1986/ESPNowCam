@@ -65,7 +65,7 @@ static RvCam camApplied;
 static bool camAppliedValid = false;
 
 // calibration, replaced by the values of the CYD
-static RvServo sv = {{RV_MAGIC, RV_SERVO, 0}, 1500, 1500, 1000, 2000, 1000, 2000, 0, 0, 0, 1, 0};
+static RvServo sv = {{RV_MAGIC, RV_SERVO, 0}, 1500, 1500, 1000, 2000, 1000, 2000, 0, 0, 0, 1, 0, 0};
 static int gripPct = 50, liftPct = 50;
 static bool gripperActive = false;  // after the first drive packet
 static int lastGripUs = 0, lastLiftUs = 0;
@@ -99,8 +99,9 @@ void driveServo(Servo &servo, int pin, int pct, bool invert, int centerUs) {
 }
 
 void drive(int fwd, int turn) {
-  int l = constrain(fwd + turn, -100, 100);
-  int r = constrain(fwd - turn, -100, 100);
+  // trim balances the two sides of the tank for driving straight
+  int l = constrain(fwd * (1000 + sv.trim) / 1000 + turn, -100, 100);
+  int r = constrain(fwd * (1000 - sv.trim) / 1000 - turn, -100, 100);
   driveServo(servoLeft, SERVO_L_PIN, l, sv.revL, sv.centerL);
   driveServo(servoRight, SERVO_R_PIN, r, sv.revR, sv.centerR);
 }

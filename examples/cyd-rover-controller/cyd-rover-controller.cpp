@@ -5,10 +5,11 @@
  * This file is part ESPNowCam project:
  * https://github.com/hpsaturn/ESPNowCam
  *
- * Drive mode:   A forward, B backward, LEFT/RIGHT turn, UP/DOWN speed +10% / -10%
- * Gripper mode: A forward, B backward, UP/DOWN lift up/down, LEFT/RIGHT gripper open/close
- * Both modes:   START fire (held)
- * SELECT short: switch drive / gripper mode, SELECT long: speed back to 50%
+ * UP/DOWN forward/backward, LEFT/RIGHT turn
+ * SELECT short: speed 25/50/75/100% (cycle)
+ * A gripper close, B gripper open, SELECT held + A/B: lift up/down
+ * START fire (held), START long: calibration mode (see below)
+ * Calibration: UP/DOWN drive, LEFT/RIGHT trim until the tank drives straight, START long to leave
  * START+SELECT: config menu (UP/DOWN select, LEFT/RIGHT change, A scan/close, B close)
 **************************************************/
 
@@ -36,11 +37,13 @@
 #define BTN_SELECT 0x80
 
 #define SPEED_DEFAULT 50
-#define SELECT_LONG_MS 600
+#define START_LONG_MS 800
 // gripper / lift travel in percent per second while a button is held
 #ifndef GRIP_RATE_PCT_S
 #define GRIP_RATE_PCT_S 60
 #endif
+// trim change in permille per second while LEFT/RIGHT is held in calibration mode
+#define TRIM_RATE_PM_S 60
 
 // the menu is drawn below this line, above it the live image stays visible
 #define MENU_TOP 96
@@ -63,7 +66,7 @@ struct ServoCfg {
 struct Cfg {
   uint8_t tank = 1;
   uint8_t size = 2;
-  uint8_t quality = 15;
+  uint8_t quality = 40;
   int8_t brightness = 0;
   int8_t contrast = 0;
   int8_t saturation = 0;
@@ -89,7 +92,7 @@ static int imgW = 0, imgH = 0, offX = 0, offY = 0;
 static SemaphoreHandle_t radioMutex;
 static volatile uint8_t btnState = 0;
 static volatile uint8_t speedPct = SPEED_DEFAULT;
-static volatile bool gripperMode = false;
+static volatile bool calibMode = false;
 static volatile int gripPct = 50, liftPct = 50;
 static volatile bool menuOpen = false;
 static volatile bool menuDirty = false;
@@ -103,23 +106,31 @@ static int menuScroll = 0;
 
 // camera image rotation 0..3 = 0/90/180/270 degrees, the screen itself stays portrait
 static uint8_t viewRot = 1;
-#define MENU_ITEMS 22
+// drive trim per tank in permille, own NVS keys (not part of Cfg)
+static int16_t trimPm[RV_MAX_TANKS];
+
+#define MENU_ITEMS 23
 enum MenuItem {
   M_TANK, M_SCAN, M_RES, M_QUALITY, M_BRIGHT, M_CONTRAST, M_SAT, M_MIRROR, M_FLIP, M_ROT, M_CROSS,
-  M_CENTER_L, M_CENTER_R, M_REV_L, M_REV_R, M_GRIP_MIN, M_GRIP_MAX, M_GRIP_REV, M_LIFT_MIN, M_LIFT_MAX,
-  M_LIFT_REV, M_CLOSE
+  M_CENTER_L, M_CENTER_R, M_REV_L, M_REV_R, M_TRIM, M_GRIP_MIN, M_GRIP_MAX, M_GRIP_REV, M_LIFT_MIN,
+  M_LIFT_MAX, M_LIFT_REV, M_CLOSE
 };
-static const char *labels[MENU_ITEMS] = {"Tank",        "Scan tanks",   "Resolution", "JPEG quality",
-                                         "Brightness",  "Contrast",     "Saturation", "Mirror",
-                                         "Flip",        "Image rotation", "Crosshair",  "Servo L center",
-                                         "Servo R center", "Servo L reverse", "Servo R reverse", "Grip min",
-                                         "Grip max",    "Grip reverse", "Lift min",   "Lift max",
-                                         "Lift reverse", "Close"};
+static const char *labels[MENU_ITEMS] = {"Tank",           "Scan tanks",      "Resolution",   "JPEG quality",
+                                         "Brightness",     "Contrast",        "Saturation",   "Mirror",
+                                         "Flip",           "Image rotation",  "Crosshair",    "Servo L center",
+                                         "Servo R center", "Servo L reverse", "Servo R reverse", "Drive trim",
+                                         "Grip min",       "Grip max",        "Grip reverse", "Lift min",
+                                         "Lift max",       "Lift reverse",    "Close"};
 static const char *sizeNames[3] = {"160x120", "240x176", "320x240"};
 
 bool tankOnline() { return millis() - lastPong < 2000 || millis() - lastFrameStamp < 2000; }
 
-ServoCfg &curServo() { return cfg.sv[constrain(cfg.tank, 1, RV_MAX_TANKS) - 1]; }
+int tankIdx() { return constrain(cfg.tank, 1, RV_MAX_TANKS) - 1; }
+ServoCfg &curServo() { return cfg.sv[tankIdx()]; }
+
+void trimText(int16_t t, char *out, size_t n) {
+  snprintf(out, n, "%c%d.%d%%", t < 0 ? '-' : '+', abs(t) / 10, abs(t) % 10);
+}
 
 void loadCfg() {
   prefs.begin("rover", false);
@@ -127,13 +138,29 @@ void loadCfg() {
   // a stored config of an older layout has another size and is ignored
   if (prefs.getBytes("cfg", &tmp, sizeof(tmp)) == sizeof(tmp)) cfg = tmp;
   cfg.tank = constrain(cfg.tank, 1, RV_MAX_TANKS);
-  // own key, so adding it did not invalidate the stored config
+  // own keys, so adding them did not invalidate the stored config
   viewRot = prefs.getUChar("rot", 1) & 3;
+  for (int i = 0; i < RV_MAX_TANKS; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "trim%d", i + 1);
+    trimPm[i] = prefs.getShort(key, 0);
+  }
+  // one-time: the former default quality 15 maps to a very low JPEG quality (grey, washed out colors)
+  if (prefs.getUChar("ver", 0) < 2) {
+    cfg.quality = 40;
+    prefs.putUChar("ver", 2);
+    prefs.putBytes("cfg", &cfg, sizeof(cfg));
+  }
 }
 
 void saveCfg() {
   prefs.putBytes("cfg", &cfg, sizeof(cfg));
   prefs.putUChar("rot", viewRot);
+  for (int i = 0; i < RV_MAX_TANKS; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "trim%d", i + 1);
+    prefs.putShort(key, trimPm[i]);
+  }
 }
 
 void sendPacket(const void *p, size_t n) {
@@ -216,10 +243,10 @@ uint8_t servoPreview() {
 
 void controlTask(void *arg) {
   uint8_t prev = 0;
-  bool selArmed = false, selLong = false, suppress = false, comboPrev = false;
+  bool selArmed = false, selUsed = false, startLong = false, suppress = false, comboPrev = false;
   int8_t lastFwd = 0, lastTurn = 0;
   uint8_t lastFire = 0, lastGrip = 255, lastLift = 255;
-  uint32_t lastSend = 0, lastCam = 0, lastPing = 0, lastServoSend = 0, selDown = 0, lastTick = millis();
+  uint32_t lastSend = 0, lastCam = 0, lastPing = 0, lastServoSend = 0, startDown = 0, lastTick = millis();
   float gp = gripPct, lp = liftPct;
   RvServo lastServo;
   memset(&lastServo, 0, sizeof(lastServo));
@@ -238,24 +265,34 @@ void controlTask(void *arg) {
     if (combo && !comboPrev) {
       menuOpen = !menuOpen;
       menuDirty = true;
+      calibMode = false;
     }
     comboPrev = combo;
 
-    // select alone: short = switch mode, long = speed 50%. Not as part of the menu combo
+    // select alone: short press cycles the speed, held with A/B it moves the lift
     if (pressed & BTN_SELECT) {
       selArmed = true;
-      selLong = false;
-      selDown = now;
+      selUsed = false;
     }
     if (combo) selArmed = false;
-    if (selArmed && (b & BTN_SELECT) && !selLong && now - selDown >= SELECT_LONG_MS && !menuOpen && !suppress) {
-      speedPct = SPEED_DEFAULT;
-      selLong = true;
-    }
+    bool selHeld = (b & BTN_SELECT) && selArmed;
+    if (selHeld && (b & (BTN_A | BTN_B))) selUsed = true;
     if (released & BTN_SELECT) {
-      if (selArmed && !selLong && !menuOpen && !suppress) gripperMode = !gripperMode;
+      if (selArmed && !selUsed && !menuOpen && !suppress) speedPct = (speedPct >= 100) ? 25 : speedPct + 25;
       selArmed = false;
     }
+
+    // start alone: fire while held, a long press toggles the calibration mode
+    if (pressed & BTN_START) {
+      startDown = now;
+      startLong = false;
+    }
+    bool startOnly = (b & BTN_START) && !(b & BTN_SELECT);
+    if (startOnly && !startLong && now - startDown >= START_LONG_MS && !menuOpen && !suppress) {
+      calibMode = !calibMode;
+      startLong = true;
+    }
+    if (released & BTN_START) startLong = false;
 
     // after closing the menu ignore the keys until they are released
     if (menuOpen) suppress = true;
@@ -264,23 +301,30 @@ void controlTask(void *arg) {
     int8_t fwd = 0, turn = 0;
     uint8_t fire = 0;
     if (!menuOpen && !suppress) {
-      fire = (b & BTN_START) && !(b & BTN_SELECT);
       int s = speedPct;
-      fwd = ((b & BTN_A) ? s : 0) - ((b & BTN_B) ? s : 0);
-      if (gripperMode) {
+      fire = startOnly && !startLong && now - startDown < START_LONG_MS;
+      fwd = ((b & BTN_UP) ? s : 0) - ((b & BTN_DOWN) ? s : 0);
+      if (calibMode) {
+        // RIGHT = the tank should steer more to the right
+        float step = TRIM_RATE_PM_S * dt;
+        float t = trimPm[tankIdx()];
+        if (b & BTN_RIGHT) t += step;
+        if (b & BTN_LEFT) t -= step;
+        trimPm[tankIdx()] = (int16_t)lroundf(constrain(t, -400.0f, 400.0f));
+      } else {
+        turn = ((b & BTN_RIGHT) ? s : 0) - ((b & BTN_LEFT) ? s : 0);
         float step = GRIP_RATE_PCT_S * dt;
-        if (b & BTN_UP) lp += step;
-        if (b & BTN_DOWN) lp -= step;
-        if (b & BTN_RIGHT) gp += step;
-        if (b & BTN_LEFT) gp -= step;
+        if (selHeld) {
+          if (b & BTN_A) lp += step;
+          if (b & BTN_B) lp -= step;
+        } else {
+          if (b & BTN_A) gp += step;
+          if (b & BTN_B) gp -= step;
+        }
         gp = constrain(gp, 0.0f, 100.0f);
         lp = constrain(lp, 0.0f, 100.0f);
         gripPct = (int)(gp + 0.5f);
         liftPct = (int)(lp + 0.5f);
-      } else {
-        if ((pressed & BTN_UP) && speedPct < 100) speedPct = speedPct + 10;
-        if ((pressed & BTN_DOWN) && speedPct > 0) speedPct = speedPct - 10;
-        turn = ((b & BTN_RIGHT) ? s : 0) - ((b & BTN_LEFT) ? s : 0);
       }
     }
 
@@ -307,7 +351,7 @@ void controlTask(void *arg) {
       // calibration: sent at once on every change, otherwise once per second
       ServoCfg &sc = curServo();
       RvServo s = {{RV_MAGIC, RV_SERVO, cfg.tank}, sc.centerL, sc.centerR, sc.gripMin, sc.gripMax, sc.liftMin,
-                   sc.liftMax, sc.gripRev, sc.liftRev, sc.revL, sc.revR, servoPreview()};
+                   sc.liftMax, sc.gripRev, sc.liftRev, sc.revL, sc.revR, trimPm[tankIdx()], servoPreview()};
       if (memcmp(&s, &lastServo, sizeof(s)) != 0 || now - lastServoSend > 1000) {
         sendPacket(&s, sizeof(s));
         lastServo = s;
@@ -341,6 +385,12 @@ void menuValue(int i, char *out, size_t n) {
     case M_CENTER_R: snprintf(out, n, "< %u us >", sc.centerR); break;
     case M_REV_L: snprintf(out, n, "%s", sc.revL ? "on" : "off"); break;
     case M_REV_R: snprintf(out, n, "%s", sc.revR ? "on" : "off"); break;
+    case M_TRIM: {
+      char t[12];
+      trimText(trimPm[tankIdx()], t, sizeof(t));
+      snprintf(out, n, "< %s >", t);
+      break;
+    }
     case M_GRIP_MIN: snprintf(out, n, "< %u us >", sc.gripMin); break;
     case M_GRIP_MAX: snprintf(out, n, "< %u us >", sc.gripMax); break;
     case M_GRIP_REV: snprintf(out, n, "%s", sc.gripRev ? "on" : "off"); break;
@@ -436,6 +486,7 @@ void changeValue(int item, int d, int mult) {
     case M_CENTER_R: sc.centerR = constrain((int)sc.centerR + d * 5 * mult, 1000, 2000); break;
     case M_REV_L: sc.revL ^= 1; break;
     case M_REV_R: sc.revR ^= 1; break;
+    case M_TRIM: trimPm[tankIdx()] = constrain(trimPm[tankIdx()] + d * 5 * mult, -400, 400); break;
     case M_GRIP_MIN: sc.gripMin = constrain((int)sc.gripMin + d * 10 * mult, 500, 2500); break;
     case M_GRIP_MAX: sc.gripMax = constrain((int)sc.gripMax + d * 10 * mult, 500, 2500); break;
     case M_GRIP_REV: sc.gripRev ^= 1; break;
@@ -487,15 +538,16 @@ void drawCrosshair() {
 }
 
 void drawHud() {
-  char s[32];
+  char s[40], t[12];
   uint16_t color = tankOnline() ? TFT_GREEN : TFT_RED;
-  if (gripperMode) {
-    snprintf(s, sizeof(s), "T%u GRIP G%d L%d", cfg.tank, (int)gripPct, (int)liftPct);
-    if (tankOnline()) color = TFT_YELLOW;
+  if (calibMode) {
+    trimText(trimPm[tankIdx()], t, sizeof(t));
+    snprintf(s, sizeof(s), "T%u CAL TRIM %s", cfg.tank, t);
+    if (tankOnline()) color = TFT_ORANGE;
   } else {
-    snprintf(s, sizeof(s), "T%u DRIVE SPD %u%%", cfg.tank, (unsigned)speedPct);
+    snprintf(s, sizeof(s), "T%u SPD %u%% G%d L%d", cfg.tank, (unsigned)speedPct, (int)gripPct, (int)liftPct);
   }
-  tft.fillRect(0, 0, 112, 11, TFT_BLACK);
+  tft.fillRect(0, 0, 130, 11, TFT_BLACK);
   tft.setTextColor(color, TFT_BLACK);
   tft.setTextDatum(TL_DATUM);
   tft.drawString(s, 2, 2, 1);
@@ -563,12 +615,17 @@ void setup() {
 }
 
 void loop() {
-  static bool menuShown = false;
+  static bool menuShown = false, calibShown = false;
   if (menuOpen != menuShown) {
     menuShown = menuOpen;
     tft.fillScreen(TFT_BLACK);
     if (menuOpen) menuDirty = true;
     else saveCfg();
+  }
+  // store the trim when the calibration mode is left
+  if (calibMode != calibShown) {
+    calibShown = calibMode;
+    if (!calibMode) saveCfg();
   }
 
   if (menuOpen) {

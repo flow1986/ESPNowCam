@@ -45,7 +45,7 @@ Project rule: the newest binary of both envs is always committed and pushed to G
 ### Tank (Freenove ESP32-S3 WROOM CAM pinout, `CamFreenove` driver, `dio_opi`)
 - Servos: left GPIO47, right GPIO21 (build flags `SERVO_L_PIN`, `SERVO_R_PIN`).
 - Right servo is inverted by default (mirrored mounting); "Servo L reverse" / "Servo R reverse" in the CYD menu change this per servo (the old `SERVO_*_INVERT` build flags are gone).
-- Neutral pulse (center) of the drive servos is calibrated in the CYD menu (see below), `SERVO_RANGE_US` (default 400) is the pulse offset at 100% speed.
+- Neutral pulse (center) and the drive trim of the drive servos are calibrated on the CYD (see below), `SERVO_RANGE_US` (default 400) is the pulse offset at 100% speed.
 - Gripper (normal positional servos): grip servo GPIO41, lift servo GPIO42 (`GRIP_PIN`, `LIFT_PIN`). Verify these pins against your board pinout. Min/max pulse and reverse are set in the CYD menu.
 - The camera clock uses LEDC timer 3 / channel 7, the servos only get timers 0..2, so the PWM of the servos cannot disturb the camera.
 - Channel DIP switch (3 switches, each between GPIO and GND, internal pull-ups): bit0 GPIO1, bit1 GPIO2, bit2 GPIO14 (`CH_PIN0..2`). ON = 1. Value 1..7 = tank id = ESP-NOW channel; 000 falls back to 1. GPIO1/2/14 are not strapping pins.
@@ -57,17 +57,20 @@ Project rule: the newest binary of both envs is always committed and pushed to G
 
 | Button | Function |
 |---|---|
-| SELECT (short) | switch between drive mode and gripper mode (shown in the HUD) |
-| SELECT (long, 0.6 s) | speed back to 50% |
-| UP / DOWN | drive mode: speed +10% / -10% (default 50%). Gripper mode: lift up / down |
-| A / B | forward / backward, both modes |
-| LEFT / RIGHT | drive mode: turn. Gripper mode: gripper open / close |
-| START (held) | fire (prepared: `fire` flag in `RvDrive`, tank `setFire()` / `FIRE_PIN`) |
+| UP / DOWN | forward / backward |
+| LEFT / RIGHT | turn |
+| SELECT (short) | speed cycles 25% - 50% - 75% - 100% (default 50%) |
+| A / B | gripper close / open |
+| SELECT held + A / B | lift up / down |
+| START (held) | fire (prepared: `fire` flag in `RvDrive`, tank `setFire()` / `FIRE_PIN`), only for the first 0.8 s of the press |
+| START (long, 0.8 s) | enter / leave the calibration mode |
 | START + SELECT | open / close the config menu |
 
-The HUD (top left) shows tank id and mode: `T1 DRIVE SPD 50%` or `T1 GRIP G50 L50` (gripper and lift position in percent). Green/yellow = tank online, red = offline.
+The HUD (top left) shows `T1 SPD 50% G50 L50` (tank id, speed, gripper and lift position in percent), green = tank online, red = offline. The gripper moves with 60%/s while a key is held (`GRIP_RATE_PCT_S`), the CYD sends the absolute positions, the tank holds the last position if the link is lost. 0% = min pulse, 100% = max pulse; if a direction is wrong, switch "Grip reverse" / "Lift reverse".
 
-In gripper mode the tank drives forward/backward with A/B at the current speed, but cannot turn and the speed cannot be changed (switch back to drive mode for that). The gripper moves with 60%/s while a key is held (`GRIP_RATE_PCT_S`), the CYD sends the absolute positions, the tank holds the last position if the link is lost. 0% = min pulse, 100% = max pulse; if a direction is wrong, switch "Grip reverse" / "Lift reverse".
+### Calibration mode (drive straight)
+
+Start long press enters the mode (HUD: `T1 CAL TRIM +1.2%`, orange). Drive with UP / DOWN (speed with SELECT), LEFT / RIGHT no longer turn but change the trim: if the tank veers to the left press RIGHT, and the other way round, until it drives straight forward and backward. The trim is a balance between the left and right side (left speed x (1 + trim), right speed x (1 - trim)), stored per tank id on the CYD and sent to the tank. START long press leaves the mode and stores the value. The "Drive trim" menu item shows and edits the same value (reset = bring it to +0.0%).
 
 ## Config menu
 
@@ -75,15 +78,17 @@ UP/DOWN select, LEFT/RIGHT change (hold = repeat), A runs "Scan"/"Close", B clos
 
 - Tank: 1..7, switches the CYD to that channel and addresses only that tank.
 - Scan tanks: pings channels 1..7 and jumps to the first tank found.
-- Resolution 160x120 / 240x176 / 320x240, JPEG quality 5..50 (higher = better quality and larger frames), brightness / contrast / saturation -2..2, mirror, flip.
+- Resolution 160x120 / 240x176 / 320x240, JPEG quality 5..50 (higher = better quality and larger frames, default 40), brightness / contrast / saturation -2..2, mirror, flip.
 - Crosshair on/off (center of the screen, for the later shooting version).
 - Servo calibration (stored per tank id on the CYD, sent to the tank every second):
-  - Servo L / R center (1000..2000 us, 5 us steps, 20 us while held): while one of these items is selected the tank holds both drive servos at their neutral pulse, adjust until they stand still. For continuous rotation servos the center is the important value.
+  - Servo L / R center (1000..2000 us, 5 us steps, 20 us while held): while one of these items is selected the tank holds both drive servos at their neutral pulse. Standing still alone does not make the tank drive straight (servos have a dead band and different speeds), use the calibration mode with the drive trim for that.
   - Servo L reverse / Servo R reverse: invert the direction of each drive servo separately (default: left off, right on). If the tank turns on the spot when you drive forward, one of them is wrong; if it drives backward, switch both.
+  - Drive trim (-40.0..+40.0%, 0.5% steps): left/right balance, normally set in the calibration mode.
   - Grip min / max and Lift min / max (500..2500 us, 10 us steps, 40 us while held): while an item is selected the tank moves that servo to this pulse, so the end positions can be set by eye. Grip reverse / Lift reverse invert the direction.
-- The menu scrolls (22 items).
+- The menu scrolls (23 items).
 - Image rotation: only the camera image is rotated, the screen and menu stay portrait. 90 / 270 fill the screen, 0 / 180 are wider than the screen, so the sides are cropped (black bars above and below). Stored on the CYD (own NVS key, independent of the config layout), not per tank.
-- The settings layout changed with the calibration: a config saved by an older firmware is ignored once and the defaults are used.
+- The settings layout changed with the calibration: a config saved by an older firmware is ignored once and the defaults are used. The drive trim and the image rotation are stored under their own NVS keys.
+- Colors: the sensor JPEG quality is the inverse of the menu value (sensor = 63 - menu). The former default 15 meant a very low quality (grey, washed out colors); the default is now 40 (a one-time migration sets it), a higher value gives better colors but larger frames and more latency.
 
 The camera settings are sent to the tank on every change and once per second, so a rebooted tank gets them again.
 

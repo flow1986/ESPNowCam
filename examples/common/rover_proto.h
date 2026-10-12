@@ -49,5 +49,6 @@ struct __attribute__((packed)) RvServo {
   uint16_t liftMin, liftMax;  // us
   uint8_t gripRev, liftRev;
   uint8_t revL, revR;  // reverse the left / right drive servo
+  int16_t trim;        // permille, >0 = left side faster (tank veers right)
   uint8_t preview;
 };
