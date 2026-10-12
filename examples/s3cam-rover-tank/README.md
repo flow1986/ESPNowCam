@@ -111,6 +111,23 @@ Decision: modulated IR (38 kHz) with a small code containing the shooter id, ins
 - Limitation: every tank/CYD pair has its own channel, so hits and lives are local per tank. A shared scoreboard would need a channel bridge or a referee, later.
 - Order: 1 tank with emitter + receiver and hit display on the CYD, then a second tank, then hit zones and rules.
 
+## WiFi mode plan (idea, not implemented yet)
+
+Goal: run the system either with ESP-NOW (as now) or in a normal WLAN, several tanks and CYDs in one network, plus a browser interface.
+
+- Mode select: the 3 pin DIP switch 0..6 = ESP-NOW tanks (7 channels, the tank id mapping has to be shifted, today 1..7 are used), 7 = WiFi mode. A change needs a reboot. One firmware per device contains both modes, the CYD selects the mode in its menu.
+- Setup: in WiFi mode the tank first opens an AP with a config page (SSID, password, tank id / name), stores it in NVS and then joins the existing WLAN. If joining fails it falls back to the AP. The CYD can join the WLAN from its menu. Typing a password with the D-pad is tedious: add a small on-screen character picker or an AP config page on the CYD as well.
+- "Channels" in the WLAN are only tank ids. The CYD finds tanks by UDP broadcast ping/pong (the existing `RV_PING` / `RV_PONG`) or mDNS (`tank-3.local`) and lists them in the menu like the current scan. Ids must be unique.
+- Transport: the same packets as now (`RV_DRIVE`, `RV_CAM`, `RV_SERVO`, ping) over WebSocket or UDP instead of ESP-NOW, so the tank code mainly changes at the transport. The tank serves a web page: MJPEG video, drive / gripper / camera controls and all settings of the CYD menu. Browser and CYD are both controllers.
+- Settings on the tank: calibration, trim and camera values have to move into the tank NVS (today per tank id on the CYD), because browser and CYD need the same values.
+- Several controllers: only one is active per tank (lock or last one wins), the 500 ms failsafe stays.
+- Security: protect the web interface (WPA2, password or token), otherwise anybody in the WLAN can drive the tank.
+- Bandwidth: WiFi gives far more fps than ESP-NOW (about 1 fps measured now). One stream per tank to one CYD plus one browser is realistic. 5 to 6 tanks streaming at the same time can be too much for one 2.4 GHz WLAN, then lower resolution / quality. A slow client must not stall the tank: drop old frames instead of queueing.
+- Latency: the path tank - router - CYD has two WiFi hops (a few to about 30 ms more, jitter 50 to 200 ms on a busy WLAN), but the much faster frame transfer should give a lower total latency than ESP-NOW now. The fixed parts stay: camera exposure + JPEG on the tank and decode + draw on the CYD. Keep WiFi power save off on both sides, keep one frame in flight, choose a free channel, place the router near the playground.
+- Lowest latency alternative: the CYD joins the AP of the tank directly (one hop, no router), but then only a few clients per tank and no shared network.
+- The CYD can do normal WLAN. The earlier doubt was about the raw 802.11 mode of the library, which is something different.
+- Order: 1. tank with WiFi mode, AP config and web interface, 2. CYD as WiFi client with tank search, 3. shared settings on the tank.
+
 ## Notes / open points
 
 - Menu: START + SELECT opens/closes it (B or A on "Close" also close it).
