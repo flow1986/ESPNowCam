@@ -39,6 +39,9 @@ struct __attribute__((packed)) RvCam {
   int8_t saturation;
   uint8_t hmirror;
   uint8_t vflip;
+  uint8_t wb;      // 0 auto, 1 sunny, 2 cloudy, 3 office, 4 home
+  uint8_t effect;  // 0 none, 1 negative, 2 grayscale, 3 red, 4 green, 5 blue, 6 sepia
+  int8_t aeLevel;  // exposure level -2..2
 };
 
 // preview: 0 none, 1 hold drive servos at their center pulse, 2/3 grip min/max, 4/5 lift min/max

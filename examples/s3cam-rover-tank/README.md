@@ -79,13 +79,14 @@ UP/DOWN select, LEFT/RIGHT change (hold = repeat), A runs "Scan"/"Close", B clos
 - Tank: 1..7, switches the CYD to that channel and addresses only that tank.
 - Scan tanks: pings channels 1..7 and jumps to the first tank found.
 - Resolution 160x120 / 240x176 / 320x240, JPEG quality 5..50 (higher = better quality and larger frames, default 40), brightness / contrast / saturation -2..2, mirror, flip.
+- Color and latency tuning: JPEG quality and resolution mostly decide the latency, the other items only change the look. White balance (Auto / Sunny / Cloudy / Office / Home), Effect (None, Negative, Grayscale, Red, Green, Blue, Sepia - keep it on None), Exposure level -2..2, plus brightness / contrast / saturation. The menu status row and the HUD (second line) show the measured `fps` and the average frame size in KB at the display, so quality and latency can be balanced by eye. The color items are stored under their own NVS key.
 - Crosshair on/off (center of the screen, for the later shooting version).
 - Servo calibration (stored per tank id on the CYD, sent to the tank every second):
   - Servo L / R center (1000..2000 us, 5 us steps, 20 us while held): while one of these items is selected the tank holds both drive servos at their neutral pulse. Standing still alone does not make the tank drive straight (servos have a dead band and different speeds), use the calibration mode with the drive trim for that.
   - Servo L reverse / Servo R reverse: invert the direction of each drive servo separately (default: left off, right on). If the tank turns on the spot when you drive forward, one of them is wrong; if it drives backward, switch both.
   - Drive trim (-40.0..+40.0%, 0.5% steps): left/right balance, normally set in the calibration mode.
   - Grip min / max and Lift min / max (500..2500 us, 10 us steps, 40 us while held): while an item is selected the tank moves that servo to this pulse, so the end positions can be set by eye. Grip reverse / Lift reverse invert the direction.
-- The menu scrolls (23 items).
+- The menu scrolls (26 items).
 - Image rotation: only the camera image is rotated, the screen and menu stay portrait. 90 / 270 fill the screen, 0 / 180 are wider than the screen, so the sides are cropped (black bars above and below). Stored on the CYD (own NVS key, independent of the config layout), not per tank.
 - The settings layout changed with the calibration: a config saved by an older firmware is ignored once and the defaults are used. The drive trim and the image rotation are stored under their own NVS keys.
 - Colors: the sensor JPEG quality is the inverse of the menu value (sensor = 63 - menu). The former default 15 meant a very low quality (grey, washed out colors); the default is now 40 (a one-time migration sets it), a higher value gives better colors but larger frames and more latency.

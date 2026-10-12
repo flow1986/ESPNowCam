@@ -81,6 +81,14 @@ TFT_eSPI tft;
 Preferences prefs;
 static Cfg cfg;
 
+// color settings in their own NVS key (not part of Cfg)
+struct ColorCfg {
+  uint8_t wb = 0;
+  uint8_t effect = 0;
+  int8_t ae = 0;
+};
+static ColorCfg col;
+
 static uint8_t fb[40000];   // ESPNowCam receive buffer
 static uint8_t jpg[32000];  // frame copy for decoding outside of the radio callback
 static volatile uint32_t jpg_len = 0;
@@ -109,19 +117,23 @@ static uint8_t viewRot = 1;
 // drive trim per tank in permille, own NVS keys (not part of Cfg)
 static int16_t trimPm[RV_MAX_TANKS];
 
-#define MENU_ITEMS 23
+#define MENU_ITEMS 26
 enum MenuItem {
-  M_TANK, M_SCAN, M_RES, M_QUALITY, M_BRIGHT, M_CONTRAST, M_SAT, M_MIRROR, M_FLIP, M_ROT, M_CROSS,
+  M_TANK, M_SCAN, M_RES, M_QUALITY, M_BRIGHT, M_CONTRAST, M_SAT, M_WB, M_EFFECT, M_AE, M_MIRROR, M_FLIP, M_ROT, M_CROSS,
   M_CENTER_L, M_CENTER_R, M_REV_L, M_REV_R, M_TRIM, M_GRIP_MIN, M_GRIP_MAX, M_GRIP_REV, M_LIFT_MIN,
   M_LIFT_MAX, M_LIFT_REV, M_CLOSE
 };
 static const char *labels[MENU_ITEMS] = {"Tank",           "Scan tanks",      "Resolution",   "JPEG quality",
-                                         "Brightness",     "Contrast",        "Saturation",   "Mirror",
+                                         "Brightness",     "Contrast",        "Saturation",   "White balance", "Effect", "Exposure", "Mirror",
                                          "Flip",           "Image rotation",  "Crosshair",    "Servo L center",
                                          "Servo R center", "Servo L reverse", "Servo R reverse", "Drive trim",
                                          "Grip min",       "Grip max",        "Grip reverse", "Lift min",
                                          "Lift max",       "Lift reverse",    "Close"};
 static const char *sizeNames[3] = {"160x120", "240x176", "320x240"};
+static const char *wbNames[5] = {"Auto", "Sunny", "Cloudy", "Office", "Home"};
+static const char *effectNames[7] = {"None", "Negative", "Grayscale", "Red", "Green", "Blue", "Sepia"};
+// measured at the display, shown in the menu and the HUD to tune quality against latency
+static uint32_t fpsNow = 0, avgBytes = 0;
 
 bool tankOnline() { return millis() - lastPong < 2000 || millis() - lastFrameStamp < 2000; }
 
@@ -140,6 +152,8 @@ void loadCfg() {
   cfg.tank = constrain(cfg.tank, 1, RV_MAX_TANKS);
   // own keys, so adding them did not invalidate the stored config
   viewRot = prefs.getUChar("rot", 1) & 3;
+  ColorCfg ctmp;
+  if (prefs.getBytes("col", &ctmp, sizeof(ctmp)) == sizeof(ctmp)) col = ctmp;
   for (int i = 0; i < RV_MAX_TANKS; i++) {
     char key[8];
     snprintf(key, sizeof(key), "trim%d", i + 1);
@@ -156,6 +170,7 @@ void loadCfg() {
 void saveCfg() {
   prefs.putBytes("cfg", &cfg, sizeof(cfg));
   prefs.putUChar("rot", viewRot);
+  prefs.putBytes("col", &col, sizeof(col));
   for (int i = 0; i < RV_MAX_TANKS; i++) {
     char key[8];
     snprintf(key, sizeof(key), "trim%d", i + 1);
@@ -344,7 +359,7 @@ void controlTask(void *arg) {
       if (camDirty || now - lastCam > 1000) {
         camDirty = false;
         RvCam c = {{RV_MAGIC, RV_CAM, cfg.tank}, cfg.size,       cfg.quality, cfg.brightness,
-                   cfg.contrast,                 cfg.saturation, cfg.hmirror, cfg.vflip};
+                   cfg.contrast,                 cfg.saturation, cfg.hmirror, cfg.vflip, col.wb, col.effect, col.ae};
         sendPacket(&c, sizeof(c));
         lastCam = now;
       }
@@ -377,6 +392,9 @@ void menuValue(int i, char *out, size_t n) {
     case M_BRIGHT: snprintf(out, n, "< %d >", cfg.brightness); break;
     case M_CONTRAST: snprintf(out, n, "< %d >", cfg.contrast); break;
     case M_SAT: snprintf(out, n, "< %d >", cfg.saturation); break;
+    case M_WB: snprintf(out, n, "< %s >", wbNames[col.wb % 5]); break;
+    case M_EFFECT: snprintf(out, n, "< %s >", effectNames[col.effect % 7]); break;
+    case M_AE: snprintf(out, n, "< %d >", col.ae); break;
     case M_MIRROR: snprintf(out, n, "%s", cfg.hmirror ? "on" : "off"); break;
     case M_FLIP: snprintf(out, n, "%s", cfg.vflip ? "on" : "off"); break;
     case M_ROT: snprintf(out, n, "< %d deg >", viewRot * 90); break;
@@ -403,6 +421,23 @@ void menuValue(int i, char *out, size_t n) {
 
 int menuVisRows() { return (tft.height() - (MENU_TOP + 4) - ROW_H) / ROW_H; }
 
+void drawMenuStatus() {
+  char val[24];
+  int y = MENU_TOP + 4 + menuVisRows() * ROW_H;
+  tft.fillRect(0, y, tft.width(), ROW_H, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString(scanMsg, 4, y + 1, 2);
+  uint32_t kb10 = avgBytes * 10 / 1024;
+  snprintf(val, sizeof(val), "%ufps %u.%uKB", (unsigned)fpsNow, (unsigned)(kb10 / 10), (unsigned)(kb10 % 10));
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString(val, 100, y + 1, 2);
+  snprintf(val, sizeof(val), "%d/%d", menuSel + 1, MENU_ITEMS);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString(val, tft.width() - 4, y + 1, 2);
+}
+
 void drawMenu() {
   char val[24];
   int vis = menuVisRows();
@@ -419,13 +454,7 @@ void drawMenu() {
     tft.setTextDatum(TR_DATUM);
     tft.drawString(val, tft.width() - 4, y + 1, 2);
   }
-  tft.fillRect(0, y, tft.width(), ROW_H, TFT_BLACK);
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.setTextDatum(TL_DATUM);
-  tft.drawString(scanMsg, 4, y + 1, 2);
-  snprintf(val, sizeof(val), "%d/%d", menuSel + 1, MENU_ITEMS);
-  tft.setTextDatum(TR_DATUM);
-  tft.drawString(val, tft.width() - 4, y + 1, 2);
+  drawMenuStatus();
 }
 
 void scanTanks() {
@@ -474,6 +503,9 @@ void changeValue(int item, int d, int mult) {
     case M_BRIGHT: cfg.brightness = constrain(cfg.brightness + d, -2, 2); break;
     case M_CONTRAST: cfg.contrast = constrain(cfg.contrast + d, -2, 2); break;
     case M_SAT: cfg.saturation = constrain(cfg.saturation + d, -2, 2); break;
+    case M_WB: col.wb = (col.wb + d + 5) % 5; break;
+    case M_EFFECT: col.effect = (col.effect + d + 7) % 7; break;
+    case M_AE: col.ae = constrain(col.ae + d, -2, 2); break;
     case M_MIRROR: cfg.hmirror ^= 1; break;
     case M_FLIP: cfg.vflip ^= 1; break;
     case M_ROT:
@@ -551,6 +583,10 @@ void drawHud() {
   tft.setTextColor(color, TFT_BLACK);
   tft.setTextDatum(TL_DATUM);
   tft.drawString(s, 2, 2, 1);
+  uint32_t kb10 = avgBytes * 10 / 1024;
+  snprintf(s, sizeof(s), "%ufps %u.%uKB", (unsigned)fpsNow, (unsigned)(kb10 / 10), (unsigned)(kb10 % 10));
+  tft.fillRect(0, 11, 80, 10, TFT_BLACK);
+  tft.drawString(s, 2, 12, 1);
 }
 
 void drawNoSignal() {
@@ -616,11 +652,14 @@ void setup() {
 
 void loop() {
   static bool menuShown = false, calibShown = false;
+  static uint32_t fpsStamp = 0, fpsFrames = 0, fpsBytes = 0;
   if (menuOpen != menuShown) {
     menuShown = menuOpen;
     tft.fillScreen(TFT_BLACK);
-    if (menuOpen) menuDirty = true;
-    else saveCfg();
+    if (menuOpen) {
+      menuDirty = true;
+      scanMsg[0] = 0;
+    } else saveCfg();
   }
   // store the trim when the calibration mode is left
   if (calibMode != calibShown) {
@@ -637,6 +676,8 @@ void loop() {
   }
 
   if (frame_ready) {
+    fpsFrames++;
+    fpsBytes += jpg_len;
     drawFrame();
     frame_ready = false;
     lastFrameStamp = millis();
@@ -644,6 +685,14 @@ void loop() {
   } else if (!menuOpen && !noSignalDrawn && millis() - lastFrameStamp > 2000) {
     drawNoSignal();
     noSignalDrawn = true;
+  }
+  uint32_t nowMs = millis();
+  if (nowMs - fpsStamp >= 1000) {
+    fpsNow = fpsFrames * 1000 / (nowMs - fpsStamp);
+    avgBytes = fpsFrames ? fpsBytes / fpsFrames : 0;
+    fpsFrames = fpsBytes = 0;
+    fpsStamp = nowMs;
+    if (menuOpen && !menuDirty) drawMenuStatus();
   }
   delay(1);
 }

@@ -176,6 +176,12 @@ void applyCam() {
   if (first || c.quality != camApplied.quality) s->set_quality(s, 63 - constrain(c.quality, 5, 50));
   if (first || c.hmirror != camApplied.hmirror) s->set_hmirror(s, c.hmirror);
   if (first || c.vflip != camApplied.vflip) s->set_vflip(s, c.vflip);
+  if (first || c.wb != camApplied.wb) {
+    s->set_whitebal(s, 1);
+    s->set_wb_mode(s, constrain(c.wb, 0, 4));
+  }
+  if (first || c.effect != camApplied.effect) s->set_special_effect(s, constrain(c.effect, 0, 6));
+  if (first || c.aeLevel != camApplied.aeLevel) s->set_ae_level(s, constrain(c.aeLevel, -2, 2));
   camApplied = c;
   camAppliedValid = true;
 }
