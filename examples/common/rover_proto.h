@@ -1,18 +1,17 @@
-// Packets shared by the CYD rover controller, the S3 CAM rover tank and the web UI of the tank.
-// Transport: ESPNowCam sendData() (ESP-NOW mode) or WebSocket binary messages (WiFi mode, port 81).
-// All fields are little endian and packed. ESP-NOW: video frames are raw JPEG (start with 0xFF).
-// WebSocket: a JPEG is sent in messages [0xFE][flags: 1 = first, 2 = last][up to 12000 bytes], because the
-// WebSocket library rejects frames above 15 KB. Control packets start with RV_MAGIC.
+// Packets shared by the CYD rover controller and the S3 CAM rover tank.
+// Transport: ESPNowCam sendData() (ESP-NOW).
+// All fields are little endian and packed. Video frames are raw JPEG (start with 0xFF),
+// control packets start with RV_MAGIC.
 #pragma once
 #include <stdint.h>
 
 #define RV_MAGIC 0xA5
-#define RV_MAX_TANKS 7  // tank id 1..7 (ESP-NOW: id == channel == DIP switch value, DIP 0 = WiFi mode)
+#define RV_MAX_TANKS 7  // tank id 1..7 (id == ESP-NOW channel == DIP switch value, no switch fitted = 1)
 
 enum RvType : uint8_t {
   RV_DRIVE = 1,   // controller -> tank
   RV_CAM = 2,     // camera settings: controller -> tank (stored on the tank), tank -> controller (reply to RV_GETCFG)
-  RV_PING = 3,    // controller -> tank, tank 0 = any tank on this channel / connection
+  RV_PING = 3,    // controller -> tank, tank 0 = any tank on this channel
   RV_PONG = 4,    // tank -> controller, RvPong
   RV_SERVO = 5,   // servo calibration: same direction rules as RV_CAM
   RV_GETCFG = 6   // controller -> tank, the tank answers with RV_CAM and RV_SERVO
